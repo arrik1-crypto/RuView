@@ -20,6 +20,8 @@ use axum::{
 use tokio::sync::{broadcast, RwLock};
 use tower_http::cors::CorsLayer;
 
+use crate::ble::{BleObservation, BleTracker};
+use crate::domain::picture::TacticalPicture;
 use crate::domain::reading::{ReadingInput, RoomReading, SensorRssi};
 use crate::domain::structure::{RoomId, Structure};
 use crate::engine::TacticalEngine;
@@ -35,6 +37,8 @@ pub struct AppState {
     pub updates: broadcast::Sender<String>,
     /// Raw-CSI ingest bridge (one MAT detection pipeline per room).
     pub ingest: Arc<RwLock<CsiIngest>>,
+    /// Auxiliary BLE device-presence tracker (phone-native).
+    pub ble: Arc<RwLock<BleTracker>>,
 }
 
 impl AppState {
@@ -46,12 +50,22 @@ impl AppState {
             engine: Arc::new(RwLock::new(engine)),
             updates,
             ingest: Arc::new(RwLock::new(ingest)),
+            ble: Arc::new(RwLock::new(BleTracker::new())),
         }
+    }
+
+    /// The full current picture: the engine's tactical picture with the BLE
+    /// device layer attached. Every client-facing response goes through this so
+    /// the two layers stay in one payload.
+    pub async fn current_picture(&self) -> TacticalPicture {
+        let mut picture = { self.engine.read().await.picture() };
+        picture.ble_devices = { self.ble.read().await.snapshot() };
+        picture
     }
 
     /// Serialize the current picture and push it to all subscribers.
     pub async fn broadcast_picture(&self) {
-        let picture = { self.engine.read().await.picture() };
+        let picture = self.current_picture().await;
         if let Ok(json) = serde_json::to_string(&picture) {
             // Ignore send errors: they just mean no dashboards are connected.
             let _ = self.updates.send(json);
@@ -70,6 +84,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/picture", get(get_picture))
         .route("/api/entry", get(get_entry))
         .route("/api/sensors", get(get_sensors))
+        .route("/api/ble", get(get_ble).post(post_ble))
         .route("/ws", get(ws_handler))
         .layer(CorsLayer::permissive())
         .with_state(state)
@@ -197,8 +212,7 @@ async fn post_csi(
     }
 
     state.broadcast_picture().await;
-    let picture = { state.engine.read().await.picture() };
-    (StatusCode::OK, Json(picture)).into_response()
+    (StatusCode::OK, Json(state.current_picture().await)).into_response()
 }
 
 async fn post_reading(
@@ -212,8 +226,7 @@ async fn post_reading(
     match result {
         Ok(()) => {
             state.broadcast_picture().await;
-            let picture = { state.engine.read().await.picture() };
-            (StatusCode::OK, Json(picture)).into_response()
+            (StatusCode::OK, Json(state.current_picture().await)).into_response()
         }
         Err(e) => (
             StatusCode::BAD_REQUEST,
@@ -224,8 +237,7 @@ async fn post_reading(
 }
 
 async fn get_picture(State(state): State<AppState>) -> impl IntoResponse {
-    let picture = { state.engine.read().await.picture() };
-    Json(picture)
+    Json(state.current_picture().await)
 }
 
 async fn get_entry(State(state): State<AppState>) -> impl IntoResponse {
@@ -238,6 +250,32 @@ async fn get_sensors(State(state): State<AppState>) -> impl IntoResponse {
     Json(report)
 }
 
+async fn get_ble(State(state): State<AppState>) -> impl IntoResponse {
+    let devices = { state.ble.read().await.snapshot() };
+    Json(devices)
+}
+
+/// A batch of BLE observations from the phone scanner.
+#[derive(serde::Deserialize)]
+struct BleScanInput {
+    devices: Vec<BleObservation>,
+}
+
+/// Ingest a BLE scan batch: update the tracker, prune stale devices, broadcast.
+async fn post_ble(
+    State(state): State<AppState>,
+    Json(scan): Json<BleScanInput>,
+) -> impl IntoResponse {
+    {
+        let mut ble = state.ble.write().await;
+        ble.observe(&scan.devices);
+        ble.prune();
+    }
+    state.broadcast_picture().await;
+    let devices = { state.ble.read().await.snapshot() };
+    (StatusCode::OK, Json(devices)).into_response()
+}
+
 async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
@@ -248,7 +286,7 @@ async fn ws_handler(
 async fn handle_socket(mut socket: WebSocket, state: AppState) {
     // Send the current picture immediately so a new dashboard is not blank.
     let mut rx = state.updates.subscribe();
-    let current = { state.engine.read().await.picture() };
+    let current = state.current_picture().await;
     if let Ok(json) = serde_json::to_string(&current) {
         if socket.send(Message::Text(json)).await.is_err() {
             return;
@@ -282,8 +320,10 @@ pub fn spawn_sim_loop(state: AppState) {
             engine.set_structure(scenario.structure().clone());
         }
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(700));
+        let mut k: u32 = 0;
         loop {
             interval.tick().await;
+            k = k.wrapping_add(1);
             let readings = scenario.tick();
             {
                 let mut engine = state.engine.write().await;
@@ -291,6 +331,25 @@ pub fn spawn_sim_loop(state: AppState) {
                     let _ = engine.apply_input(input);
                 }
                 engine.prune_stale();
+            }
+            // Synthetic BLE devices so the "devices (not people)" overlay is
+            // exercised in demo mode. Purely illustrative — not real radios.
+            {
+                let wobble = (k % 20) as f64 - 10.0;
+                let mut ble = state.ble.write().await;
+                ble.observe(&[
+                    crate::ble::BleObservation {
+                        id: "7a:11:22:demo-01".into(),
+                        name: Some("Phone".into()),
+                        rssi: -62.0 + wobble * 0.5,
+                    },
+                    crate::ble::BleObservation {
+                        id: "c3:44:55:demo-02".into(),
+                        name: None,
+                        rssi: -79.0 + wobble * 0.3,
+                    },
+                ]);
+                ble.prune();
             }
             state.broadcast_picture().await;
         }

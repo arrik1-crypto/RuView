@@ -66,6 +66,13 @@
   .sdot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; }
   .sdot.up { background: var(--focus); }
   .sdot.down { background: var(--active); }
+  .ble-note { font-size: 11px; color: var(--muted); margin-bottom: 8px; line-height: 1.45; }
+  .ble { display: flex; align-items: center; gap: 8px; padding: 5px 8px;
+    border: 1px dashed rgba(122,140,255,.45); border-radius: 5px; margin-bottom: 5px;
+    font-size: 12px; background: rgba(122,140,255,.06); }
+  .ble .id { font-weight: 600; color: #9db4ff; }
+  .ble .meta { margin-left: auto; color: var(--muted); font-size: 11px; text-align: right; }
+  .ble .none { color: var(--muted); font-size: 12px; }
   .summary { font-size: 12px; color: var(--ink); background: #0e1620;
     border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; }
   .disc { font-size: 11px; color: var(--muted); margin-top: 8px; line-height: 1.5; }
@@ -100,6 +107,11 @@
     <div id="rooms"></div>
     <h2>Sensors <span id="sensors-count" class="muted"></span></h2>
     <div id="sensors"></div>
+    <h2>Bluetooth <span class="muted">— devices, not people</span></h2>
+    <div class="ble-note">Phone BLE radio. Detects transmitting devices by
+      distance only (no bearing, no room). A person without a device is invisible
+      — never read as a person-finder.</div>
+    <div id="ble"></div>
   </aside>
 </main>
 
@@ -212,6 +224,7 @@ function renderPanels() {
     document.getElementById('stat-rooms').textContent = picture.occupied_rooms;
     document.getElementById('disc').textContent = picture.advisory;
     renderSensors(picture);
+    renderBle(picture);
   }
   if (entry) {
     document.getElementById('summary').textContent = entry.summary;
@@ -261,6 +274,28 @@ function renderSensors(picture) {
     el.querySelector('.rm').textContent =
       s.room_name ? '· ' + s.room_name : (s.configured ? '' : '· unexpected');
     el.querySelector('.meta').textContent = [rssi, age].filter(Boolean).join('  ·  ');
+    host.appendChild(el);
+  }
+}
+
+function renderBle(picture) {
+  const host = document.getElementById('ble');
+  host.innerHTML = '';
+  const list = picture.ble_devices || [];
+  if (!list.length) {
+    host.innerHTML = '<div class="none">No devices detected.</div>';
+    return;
+  }
+  for (const b of list) {
+    const el = document.createElement('div');
+    el.className = 'ble';
+    const d = b.distance_est_m;
+    const dist = d < 1 ? '<1 m' : '~' + (d < 10 ? d.toFixed(1) : Math.round(d)) + ' m';
+    el.innerHTML =
+      '<span class="sdot" style="background:#7a8cff"></span>' +
+      '<span class="id"></span><span class="meta"></span>';
+    el.querySelector('.id').textContent = b.name || b.id;
+    el.querySelector('.meta').textContent = Math.round(b.rssi) + ' dBm  ·  ' + dist;
     host.appendChild(el);
   }
 }

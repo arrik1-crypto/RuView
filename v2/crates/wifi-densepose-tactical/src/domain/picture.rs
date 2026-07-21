@@ -48,6 +48,27 @@ pub struct SensorSummary {
     pub last_rssi: Option<f64>,
 }
 
+/// A Bluetooth device detected by the phone's own radio.
+///
+/// **This is a device, not a person.** A single phone measures signal strength
+/// (hence a rough distance) but no bearing, and only sees devices that are
+/// actively transmitting BLE. It cannot detect a person who is not carrying a
+/// discoverable device, and it never implies a floor-plan position — which is
+/// why these are shown in a separate list, never as contacts on the map.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BleDevice {
+    /// Opaque device id (the advertised address — often randomized by the OS).
+    pub id: String,
+    /// Advertised name, if any.
+    pub name: Option<String>,
+    /// Most recent RSSI (dBm).
+    pub rssi: f64,
+    /// Very rough distance estimate from RSSI (metres) — order-of-magnitude only.
+    pub distance_est_m: f64,
+    /// Seconds since last seen.
+    pub age_secs: i64,
+}
+
 /// A snapshot of the whole structure at a moment in time.
 ///
 /// This is the payload streamed to the tactical dashboard and returned by
@@ -72,6 +93,11 @@ pub struct TacticalPicture {
     pub sensors_reporting: usize,
     /// How many nodes are configured in the floor plan.
     pub sensors_total: usize,
+    /// Bluetooth devices detected by the phone's own radio (auxiliary layer —
+    /// devices, NOT people; no floor-plan position). Attached by the API from
+    /// the BLE tracker; empty from the engine alone.
+    #[serde(default)]
+    pub ble_devices: Vec<BleDevice>,
     /// A standing reminder rendered by clients. Kept in the payload so it can
     /// never be dropped by a thin viewer.
     pub advisory: String,
@@ -133,6 +159,7 @@ impl TacticalPicture {
             sensors,
             sensors_reporting,
             sensors_total,
+            ble_devices: Vec::new(),
             advisory: STANDING_ADVISORY.to_string(),
         }
     }

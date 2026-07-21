@@ -72,6 +72,10 @@ pub mod api;
 #[cfg(feature = "api")]
 pub mod ingest;
 
+/// Bluetooth device-presence tracker (auxiliary phone-native layer).
+#[cfg(feature = "api")]
+pub mod ble;
+
 /// JNI entry point for the Android APK shell. See `android/` for the build.
 #[cfg(feature = "android")]
 pub mod android;

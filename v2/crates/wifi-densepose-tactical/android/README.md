@@ -86,6 +86,15 @@ For a first-run smoke test with no hardware, set `nativeStart(PORT, true)` in
 `MainActivity.kt` — the app then runs the built-in synthetic scenario and you
 should see contacts + the sensor panel populate immediately.
 
+## Bluetooth overlay (auxiliary)
+
+The app also scans with the phone's own BLE radio and shows detected devices in a
+separate "Bluetooth — devices, not people" panel (feeds `POST /api/ble`). It asks
+for `BLUETOOTH_SCAN` at first launch (declared `neverForLocation`, so no location
+permission); if denied, everything else still works. **This detects transmitting
+Bluetooth devices by distance only — it is not a person-finder.** A person without
+a discoverable device is invisible to it, and it is never drawn on the floor plan.
+
 ## ⚠ Operational note
 
 Decision-support only. Contacts are anonymous human presence — not identified as
