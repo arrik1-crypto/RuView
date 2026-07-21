@@ -11186,6 +11186,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "wifi-densepose-tactical"
+version = "0.3.0"
+dependencies = [
+ "axum",
+ "chrono",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower-http",
+ "tracing",
+ "uuid",
+ "wifi-densepose-mat",
+]
+
+[[package]]
 name = "wifi-densepose-train"
 version = "0.3.2"
 dependencies = [

@@ -76,6 +76,11 @@ members = [
     # submodule crates (rufield-core/-provenance/-privacy/-fusion); single
     # coupling point between RuView and the standalone RuField MFS spec.
     "crates/wifi-densepose-rufield",
+    # Tactical person-localization for law-enforcement rescue (hostage rescue,
+    # barricade). A decision-support bounded context built on wifi-densepose-mat:
+    # structure/room model, per-room contact tracking, entry advisory, Axum
+    # dashboard. Presence + coarse location only — no identity/threat inference.
+    "crates/wifi-densepose-tactical",
 ]
 # ADR-040: WASM edge crate targets wasm32-unknown-unknown (no_std),
 # excluded from workspace to avoid breaking `cargo test --workspace`.

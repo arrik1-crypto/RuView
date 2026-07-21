@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>RuView Tactical — Person Localization</title>
+<style>
+  :root {
+    --bg: #0b0f14; --panel: #131a22; --line: #223040; --ink: #d7e2ee;
+    --muted: #8296ab; --focus: #2fe08a; --active: #ff5a3c; --restless: #ffb020;
+    --stationary: #2fe08a; --faint: #7d8ea0; --accent: #4aa3ff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 14px/1.4 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    display: flex; flex-direction: column; height: 100vh; overflow: hidden;
+  }
+  header { background: #7a1206; color: #fff; padding: 8px 14px; font-size: 12px; }
+  header b { letter-spacing: .04em; }
+  .warn { color: #ffd9d0; }
+  .bar {
+    display: flex; align-items: center; gap: 18px; padding: 10px 16px;
+    background: var(--panel); border-bottom: 1px solid var(--line);
+  }
+  .bar h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  .bar .stat { color: var(--muted); font-size: 12px; }
+  .bar .stat b { color: var(--ink); font-size: 15px; }
+  .mode { margin-left: auto; font-size: 11px; color: #ffd9d0; background:#3a0d05;
+    padding: 3px 8px; border-radius: 4px; border: 1px solid #7a1206; }
+  main { display: flex; flex: 1; min-height: 0; }
+  #floor { flex: 1; min-width: 0; position: relative; }
+  canvas { display: block; width: 100%; height: 100%; }
+  aside {
+    width: 340px; background: var(--panel); border-left: 1px solid var(--line);
+    overflow-y: auto; padding: 12px 14px;
+  }
+  aside h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
+    color: var(--muted); margin: 16px 0 8px; }
+  aside h2:first-child { margin-top: 0; }
+  .room { border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px;
+    margin-bottom: 8px; }
+  .room .top { display: flex; justify-content: space-between; align-items: baseline; }
+  .room .name { font-weight: 600; }
+  .room .count { font-size: 13px; }
+  .room .why { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .pri { font-size: 10px; text-transform: uppercase; letter-spacing: .05em;
+    padding: 2px 6px; border-radius: 3px; font-weight: 700; }
+  .pri.focus { background: rgba(47,224,138,.15); color: var(--focus); }
+  .pri.active { background: rgba(255,90,60,.18); color: var(--active); }
+  .pri.monitor { background: rgba(255,176,32,.15); color: var(--restless); }
+  .pri.no_contact { background: rgba(125,142,160,.12); color: var(--faint); }
+  .legend { display: flex; flex-wrap: wrap; gap: 10px 14px; font-size: 11px;
+    color: var(--muted); padding: 8px 16px; background: var(--panel);
+    border-top: 1px solid var(--line); }
+  .legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+  .summary { font-size: 12px; color: var(--ink); background: #0e1620;
+    border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; }
+  .disc { font-size: 11px; color: var(--muted); margin-top: 8px; line-height: 1.5; }
+  #status { font-size: 11px; color: var(--muted); }
+  #status.live b { color: var(--focus); }
+  #status.down b { color: var(--active); }
+</style>
+</head>
+<body>
+<header>
+  <b>⚠ DECISION-SUPPORT ONLY.</b>
+  <span class="warn">Contacts are anonymous human presence — <b>NOT</b> identified as hostage or suspect, <b>NOT</b> confirmed armed.
+  Absence of a contact does <b>not</b> mean a room is empty. Corroborate before acting. Never the sole basis for use of force.</span>
+</header>
+
+<div class="bar">
+  <h1 id="structure-name">RuView Tactical</h1>
+  <div class="stat">People (est.) <b id="stat-people">–</b></div>
+  <div class="stat">Occupied rooms <b id="stat-rooms">–</b></div>
+  <div id="status" class="down">Link <b>connecting…</b></div>
+  <div class="mode" id="mode-badge">—</div>
+</div>
+
+<main>
+  <div id="floor"><canvas id="cv"></canvas></div>
+  <aside>
+    <h2>Situation</h2>
+    <div class="summary" id="summary">Waiting for first picture…</div>
+    <div class="disc" id="disc"></div>
+    <h2>Rooms — attention order</h2>
+    <div id="rooms"></div>
+  </aside>
+</main>
+
+<div class="legend">
+  <span><i class="dot" style="background:var(--stationary)"></i> stationary (breathing)</span>
+  <span><i class="dot" style="background:var(--restless)"></i> restless</span>
+  <span><i class="dot" style="background:var(--active)"></i> moving</span>
+  <span><i class="dot" style="border:1px dashed var(--muted);background:transparent"></i> room-level only</span>
+  <span>ring = position uncertainty</span>
+</div>
+
+<script>
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+let structure = null, picture = null, entry = null;
+let pulse = 0;
+
+const MOTION_COLOR = {
+  stationary: getComputedStyle(document.documentElement).getPropertyValue('--stationary').trim(),
+  restless: getComputedStyle(document.documentElement).getPropertyValue('--restless').trim(),
+  moving: getComputedStyle(document.documentElement).getPropertyValue('--active').trim(),
+};
+
+function fitCanvas() {
+  const r = cv.parentElement.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  cv.width = r.width * dpr; cv.height = r.height * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { w: r.width, h: r.height };
+}
+
+function planBounds() {
+  if (!structure || !structure.rooms.length) return { minx: 0, miny: 0, maxx: 10, maxy: 10 };
+  let minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
+  for (const r of structure.rooms) {
+    minx = Math.min(minx, r.bounds.min_x); miny = Math.min(miny, r.bounds.min_y);
+    maxx = Math.max(maxx, r.bounds.max_x); maxy = Math.max(maxy, r.bounds.max_y);
+  }
+  return { minx, miny, maxx, maxy };
+}
+
+function draw() {
+  const { w, h } = fitCanvas();
+  ctx.clearRect(0, 0, w, h);
+  if (!structure) return;
+
+  const b = planBounds();
+  const pad = 34;
+  const sx = (w - pad * 2) / Math.max(0.5, b.maxx - b.minx);
+  const sy = (h - pad * 2) / Math.max(0.5, b.maxy - b.miny);
+  const s = Math.min(sx, sy);
+  const ox = pad + (w - pad * 2 - (b.maxx - b.minx) * s) / 2;
+  const oy = pad + (h - pad * 2 - (b.maxy - b.miny) * s) / 2;
+  const X = x => ox + (x - b.minx) * s;
+  const Y = y => oy + (y - b.miny) * s;
+
+  // rooms
+  const occ = {};
+  if (picture) for (const r of picture.rooms) occ[r.room_id] = r;
+  ctx.lineWidth = 1.5;
+  ctx.font = '12px ui-monospace, monospace';
+  for (const room of structure.rooms) {
+    const ro = occ[room.id];
+    const active = ro && ro.contact_count > 0;
+    ctx.fillStyle = active ? 'rgba(74,163,255,0.07)' : 'rgba(255,255,255,0.02)';
+    ctx.strokeStyle = active ? 'rgba(74,163,255,0.55)' : '#2a3a4c';
+    const x = X(room.bounds.min_x), y = Y(room.bounds.min_y);
+    const rw = (room.bounds.max_x - room.bounds.min_x) * s;
+    const rh = (room.bounds.max_y - room.bounds.min_y) * s;
+    ctx.fillRect(x, y, rw, rh);
+    ctx.strokeRect(x, y, rw, rh);
+    ctx.fillStyle = '#8fa4ba';
+    ctx.fillText(room.name, x + 6, y + 16);
+    if (ro && ro.occupancy_estimate > 0) {
+      ctx.fillStyle = '#d7e2ee';
+      ctx.fillText('×' + ro.occupancy_estimate, x + 6, y + 32);
+    }
+    // sensor nodes
+    ctx.fillStyle = '#3a5570';
+    for (const sensor of room.sensors) {
+      ctx.beginPath(); ctx.arc(X(sensor.x), Y(sensor.y), 2.5, 0, 7); ctx.fill();
+    }
+  }
+
+  // contacts
+  if (picture) for (const c of picture.contacts) {
+    const px = X(c.x), py = Y(c.y);
+    const col = MOTION_COLOR[c.motion] || '#fff';
+    // uncertainty ring
+    ctx.beginPath();
+    ctx.arc(px, py, Math.max(6, c.uncertainty_radius_m * s), 0, 7);
+    ctx.strokeStyle = col + '55';
+    ctx.setLineDash(c.point_fix ? [] : [4, 4]);
+    ctx.lineWidth = 1.25; ctx.stroke(); ctx.setLineDash([]);
+    // pulsing core
+    const p = 0.5 + 0.5 * Math.sin(pulse);
+    ctx.beginPath(); ctx.arc(px, py, 5 + p * 2.5, 0, 7);
+    ctx.fillStyle = col; ctx.globalAlpha = 0.85; ctx.fill(); ctx.globalAlpha = 1;
+    if (c.breathing_bpm) {
+      ctx.fillStyle = '#cfe0ef'; ctx.font = '10px ui-monospace, monospace';
+      ctx.fillText(Math.round(c.breathing_bpm) + ' bpm', px + 9, py + 3);
+    }
+  }
+}
+
+function renderPanels() {
+  if (picture) {
+    document.getElementById('structure-name').textContent = picture.structure_name;
+    document.getElementById('stat-people').textContent = picture.total_occupancy_estimate;
+    document.getElementById('stat-rooms').textContent = picture.occupied_rooms;
+    document.getElementById('disc').textContent = picture.advisory;
+  }
+  if (entry) {
+    document.getElementById('summary').textContent = entry.summary;
+    const host = document.getElementById('rooms');
+    host.innerHTML = '';
+    for (const r of entry.rooms) {
+      const el = document.createElement('div');
+      el.className = 'room';
+      el.innerHTML =
+        '<div class="top"><span class="name"></span>' +
+        '<span class="pri ' + r.priority + '">' + r.priority.replace('_',' ') + '</span></div>' +
+        '<div class="count">est. <b></b> · ' + (r.localizable ? 'point fix' : 'room-level') + '</div>' +
+        '<div class="why"></div>';
+      el.querySelector('.name').textContent = r.room_name;
+      el.querySelector('.count b').textContent = r.occupancy_estimate;
+      el.querySelector('.why').textContent = r.rationale;
+      host.appendChild(el);
+    }
+  }
+}
+
+function setStatus(live) {
+  const s = document.getElementById('status');
+  s.className = live ? 'live' : 'down';
+  s.innerHTML = 'Link <b>' + (live ? 'live' : 'reconnecting…') + '</b>';
+}
+
+async function refreshEntry() {
+  try { entry = await (await fetch('/api/entry')).json(); renderPanels(); } catch (e) {}
+}
+
+async function loadStructure() {
+  structure = await (await fetch('/api/structure')).json();
+  try {
+    const h = await (await fetch('/api/health')).json();
+    document.getElementById('mode-badge').textContent = 'v' + (h.version || '');
+  } catch (e) {}
+}
+
+function connectWs() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const ws = new WebSocket(proto + '://' + location.host + '/ws');
+  ws.onopen = () => setStatus(true);
+  ws.onclose = () => { setStatus(false); setTimeout(connectWs, 1200); };
+  ws.onmessage = ev => { picture = JSON.parse(ev.data); renderPanels(); };
+}
+
+function loop() { pulse += 0.12; draw(); requestAnimationFrame(loop); }
+
+(async function init() {
+  await loadStructure();
+  connectWs();
+  refreshEntry();
+  setInterval(refreshEntry, 1500);
+  window.addEventListener('resize', draw);
+  loop();
+})();
+</script>
+</body>
+</html>

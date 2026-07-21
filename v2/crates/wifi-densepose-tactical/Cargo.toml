@@ -1,0 +1,51 @@
+[package]
+name = "wifi-densepose-tactical"
+version = "0.3.0"
+edition = "2021"
+authors = ["rUv <ruv@ruv.net>", "WiFi-DensePose Contributors"]
+description = "Tactical person-localization for law-enforcement rescue operations — a decision-support layer over WiFi-CSI through-wall sensing (built on wifi-densepose-mat)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ruvnet/wifi-densepose"
+keywords = ["wifi", "sensing", "rescue", "localization", "tactical"]
+categories = ["science", "algorithms"]
+
+[features]
+# `api` pulls the Axum web stack + the bundled tactical dashboard binary.
+# `sim` provides the hardware-free scenario simulator so the app is runnable
+# without live CSI capture. Both are on by default so `cargo run` just works;
+# `--no-default-features` builds the pure library (domain + engine) for the
+# appliance/edge target with no web or async dependency.
+default = ["api", "sim"]
+sim = []
+api = ["sim", "dep:axum", "dep:tokio", "dep:tower-http", "dep:futures-util"]
+
+[dependencies]
+# Reuse MAT's validated sensing primitives: vital-signs detection, 3D
+# coordinates + uncertainty, RSSI triangulation localization, and the scan-zone
+# / sensor-placement model. `serde` is enabled so those domain types serialize
+# across the API boundary.
+wifi-densepose-mat = { version = "0.3.1", path = "../wifi-densepose-mat", default-features = false, features = ["std", "serde"] }
+
+# Serialization — always on: the tactical domain (structure, contacts, picture)
+# is (de)serialized both by the API and by callers embedding this as a library.
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.6", features = ["v4", "serde"] }
+thiserror = "2.0"
+tracing = "0.1"
+
+# Web surface (feature = "api")
+axum = { version = "0.7", features = ["ws"], optional = true }
+tokio = { version = "1.35", features = ["rt-multi-thread", "macros", "sync", "time"], optional = true }
+tower-http = { version = "0.6", features = ["cors"], optional = true }
+futures-util = { version = "0.3", optional = true }
+
+[[bin]]
+name = "ruview-tactical"
+path = "src/main.rs"
+required-features = ["api"]
+
+[dev-dependencies]
+tokio = { version = "1.35", features = ["rt", "macros", "sync", "time"] }
