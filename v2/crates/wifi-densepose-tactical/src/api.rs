@@ -163,6 +163,33 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
     }
 }
 
+/// Drive the built-in scenario in the background: tick, apply readings, prune
+/// stale contacts, broadcast the new picture — roughly once per sensing cycle.
+/// Shared by the desktop binary and the Android JNI entry point. Overwrites the
+/// engine's structure with the scenario's so room ids line up with its readings.
+pub fn spawn_sim_loop(state: AppState) {
+    tokio::spawn(async move {
+        let mut scenario = crate::sim::Scenario::new();
+        {
+            let mut engine = state.engine.write().await;
+            engine.set_structure(scenario.structure().clone());
+        }
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(700));
+        loop {
+            interval.tick().await;
+            let readings = scenario.tick();
+            {
+                let mut engine = state.engine.write().await;
+                for input in &readings {
+                    let _ = engine.apply_input(input);
+                }
+                engine.prune_stale();
+            }
+            state.broadcast_picture().await;
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -11192,6 +11192,7 @@ dependencies = [
  "axum",
  "chrono",
  "futures-util",
+ "jni",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

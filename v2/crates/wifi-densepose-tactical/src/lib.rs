@@ -49,7 +49,12 @@
 //!   api (Axum) ──serves──▶ tactical dashboard (top-down floor plan, live)
 //! ```
 
-#![forbid(unsafe_code)]
+// The whole crate is safe Rust, except the single `#[no_mangle]` JNI export in
+// `android.rs` (which the `unsafe_code` lint classes as unsafe). Keep the forbid
+// for every other build; relax to `deny` under the `android` feature so that one
+// export can opt out locally.
+#![cfg_attr(not(feature = "android"), forbid(unsafe_code))]
+#![cfg_attr(feature = "android", deny(unsafe_code))]
 #![warn(missing_docs)]
 
 pub mod domain;
@@ -62,6 +67,10 @@ pub mod sim;
 
 #[cfg(feature = "api")]
 pub mod api;
+
+/// JNI entry point for the Android APK shell. See `android/` for the build.
+#[cfg(feature = "android")]
+pub mod android;
 
 pub use domain::{
     contact::{ContactId, LifeSign, Motion, PersonContact},

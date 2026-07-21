@@ -18,6 +18,16 @@ categories = ["science", "algorithms"]
 default = ["api", "sim"]
 sim = []
 api = ["sim", "dep:axum", "dep:tokio", "dep:tower-http", "dep:futures-util"]
+# `android` adds the JNI entry point (`src/android.rs`) so the server can be
+# started from a Kotlin `System.loadLibrary` shell and driven by a WebView.
+# Build the `.so` with `cargo ndk` (see `android/`). Pure-Rust tree — no NDK C
+# libs are pulled beyond the standard Android toolchain.
+android = ["api", "dep:jni"]
+
+# Build a C-ABI dynamic library (`libwifi_densepose_tactical.so`) for the
+# Android JNI shell, while keeping the normal `lib`/`bin` targets for desktop.
+[lib]
+crate-type = ["lib", "cdylib"]
 
 [dependencies]
 # Reuse MAT's validated sensing primitives: vital-signs detection, 3D
@@ -38,9 +48,12 @@ tracing = "0.1"
 
 # Web surface (feature = "api")
 axum = { version = "0.7", features = ["ws"], optional = true }
-tokio = { version = "1.35", features = ["rt-multi-thread", "macros", "sync", "time"], optional = true }
+tokio = { version = "1.35", features = ["rt-multi-thread", "macros", "sync", "time", "net"], optional = true }
 tower-http = { version = "0.6", features = ["cors"], optional = true }
 futures-util = { version = "0.3", optional = true }
+
+# JNI bridge for the Android APK shell (feature = "android").
+jni = { version = "0.21", optional = true }
 
 [[bin]]
 name = "ruview-tactical"

@@ -5,11 +5,9 @@
 //! (and `POST /api/structure` with your floor plan) to drive it live; pass
 //! `--no-sim` to start empty and wait for real readings.
 
-use std::time::Duration;
-
-use wifi_densepose_tactical::api::{router, AppState};
+use wifi_densepose_tactical::api::{router, spawn_sim_loop, AppState};
 use wifi_densepose_tactical::engine::TacticalEngine;
-use wifi_densepose_tactical::sim::{demo_structure, Scenario};
+use wifi_densepose_tactical::sim::demo_structure;
 
 #[tokio::main]
 async fn main() {
@@ -47,34 +45,6 @@ async fn main() {
         eprintln!("[ruview-tactical] server error: {e}");
         std::process::exit(1);
     }
-}
-
-/// Drive the built-in scenario: tick, apply readings, prune stale contacts,
-/// broadcast the new picture — roughly once per sensing cycle.
-fn spawn_sim_loop(state: AppState) {
-    tokio::spawn(async move {
-        let mut scenario = Scenario::new();
-        // Load the scenario's structure (identical to `demo_structure`, but keeps
-        // room ids consistent with the readings the scenario emits).
-        {
-            let mut engine = state.engine.write().await;
-            engine.set_structure(scenario.structure().clone());
-        }
-
-        let mut interval = tokio::time::interval(Duration::from_millis(700));
-        loop {
-            interval.tick().await;
-            let readings = scenario.tick();
-            {
-                let mut engine = state.engine.write().await;
-                for input in &readings {
-                    let _ = engine.apply_input(input);
-                }
-                engine.prune_stale();
-            }
-            state.broadcast_picture().await;
-        }
-    });
 }
 
 /// Minimal tracing init without pulling `tracing-subscriber` as a hard dep:
