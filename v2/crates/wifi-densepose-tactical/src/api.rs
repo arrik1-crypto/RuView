@@ -22,7 +22,7 @@ use tower_http::cors::CorsLayer;
 
 use crate::ble::{BleObservation, BleTracker};
 use crate::domain::picture::TacticalPicture;
-use crate::domain::reading::{ReadingInput, RoomReading, SensorRssi};
+use crate::domain::reading::{MmwaveReading, ReadingInput, RoomReading, SensorRssi};
 use crate::domain::structure::{RoomId, Structure};
 use crate::engine::TacticalEngine;
 use crate::entry::EntryAdvisor;
@@ -81,6 +81,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/structure", get(get_structure).post(post_structure))
         .route("/api/reading", post(post_reading))
         .route("/api/csi", post(post_csi))
+        .route("/api/mmwave", post(post_mmwave))
         .route("/api/picture", get(get_picture))
         .route("/api/entry", get(get_entry))
         .route("/api/sensors", get(get_sensors))
@@ -236,6 +237,28 @@ async fn post_reading(
     }
 }
 
+/// Ingest an mmWave (MR60BHA2) corroboration reading for a room.
+async fn post_mmwave(
+    State(state): State<AppState>,
+    Json(reading): Json<MmwaveReading>,
+) -> impl IntoResponse {
+    let result = {
+        let mut engine = state.engine.write().await;
+        engine.apply_mmwave(&reading)
+    };
+    match result {
+        Ok(()) => {
+            state.broadcast_picture().await;
+            (StatusCode::OK, Json(state.current_picture().await)).into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
 async fn get_picture(State(state): State<AppState>) -> impl IntoResponse {
     Json(state.current_picture().await)
 }
@@ -330,6 +353,18 @@ pub fn spawn_sim_loop(state: AppState) {
                 for input in &readings {
                     let _ = engine.apply_input(input);
                 }
+                // Synthetic mmWave corroboration on the held room (Bedroom 2),
+                // as if an ESP32-C6/MR60BHA2 node covered it. Demo only.
+                let _ = engine.apply_mmwave(&crate::domain::reading::MmwaveReading {
+                    room_id: None,
+                    room_name: Some("Bedroom 2".into()),
+                    presence: true,
+                    breathing_bpm: Some(15.0 + (k % 6) as f32 * 0.2),
+                    heart_rate_bpm: Some(70.0 + (k % 10) as f32),
+                    distance_cm: Some(300.0),
+                    targets: 2,
+                    confidence: 88,
+                });
                 engine.prune_stale();
             }
             // Synthetic BLE devices so the "devices (not people)" overlay is

@@ -6,8 +6,8 @@ use chrono::{DateTime, Duration, Utc};
 use wifi_densepose_mat::localization::LocalizationService;
 
 use crate::domain::contact::{ContactId, PersonContact};
-use crate::domain::picture::{SensorSummary, TacticalPicture};
-use crate::domain::reading::RoomReading;
+use crate::domain::picture::{MmwaveCorroboration, SensorSummary, TacticalPicture};
+use crate::domain::reading::{MmwaveReading, RoomReading};
 use crate::domain::structure::{Room, RoomId, Structure};
 use crate::error::TacticalError;
 
@@ -17,6 +17,18 @@ struct SensorActivity {
     room_id: RoomId,
     last_seen: DateTime<Utc>,
     last_rssi: Option<f64>,
+}
+
+/// Last mmWave reading for a room.
+#[derive(Debug, Clone)]
+struct MmwaveState {
+    presence: bool,
+    breathing_bpm: Option<f32>,
+    heart_rate_bpm: Option<f32>,
+    distance_cm: Option<f32>,
+    targets: u8,
+    confidence: u8,
+    last_seen: DateTime<Utc>,
 }
 
 /// Tunables for tracking behaviour.
@@ -32,6 +44,8 @@ pub struct EngineConfig {
     /// A sensor node not heard from within this many seconds is reported as not
     /// reporting (a dropout) in the sensor status roll-up.
     pub sensor_stale_secs: i64,
+    /// An mmWave reading older than this many seconds is dropped from the picture.
+    pub mmwave_stale_secs: i64,
 }
 
 impl Default for EngineConfig {
@@ -40,6 +54,7 @@ impl Default for EngineConfig {
             position_alpha: 0.5,
             contact_ttl_secs: 8,
             sensor_stale_secs: 6,
+            mmwave_stale_secs: 6,
         }
     }
 }
@@ -57,6 +72,8 @@ pub struct TacticalEngine {
     occupancy: HashMap<RoomId, u32>,
     /// Last-heard state per sensor node id.
     sensors: HashMap<String, SensorActivity>,
+    /// Latest mmWave reading per room.
+    mmwave: HashMap<RoomId, MmwaveState>,
     config: EngineConfig,
 }
 
@@ -69,6 +86,7 @@ impl TacticalEngine {
             contacts: HashMap::new(),
             occupancy: HashMap::new(),
             sensors: HashMap::new(),
+            mmwave: HashMap::new(),
             config: EngineConfig::default(),
         }
     }
@@ -87,6 +105,68 @@ impl TacticalEngine {
         self.contacts.clear();
         self.occupancy.clear();
         self.sensors.clear();
+        self.mmwave.clear();
+    }
+
+    /// Ingest an mmWave (MR60BHA2) reading: resolve its room (by id or name) and
+    /// store it as the room's latest corroboration reading.
+    pub fn apply_mmwave(&mut self, reading: &MmwaveReading) -> Result<(), TacticalError> {
+        let room_id = self
+            .resolve_room(reading.room_id, reading.room_name.as_deref())
+            .ok_or_else(|| {
+                TacticalError::UnknownRoom(
+                    reading
+                        .room_name
+                        .clone()
+                        .or_else(|| reading.room_id.map(|id| id.to_string()))
+                        .unwrap_or_else(|| "unspecified".to_string()),
+                )
+            })?;
+        self.mmwave.insert(
+            room_id,
+            MmwaveState {
+                presence: reading.presence,
+                // Only carry a rate the radar actually resolved (> 0).
+                breathing_bpm: reading.breathing_bpm.filter(|v| *v > 0.0),
+                heart_rate_bpm: reading.heart_rate_bpm.filter(|v| *v > 0.0),
+                distance_cm: reading.distance_cm.filter(|v| *v > 0.0),
+                targets: reading.targets,
+                confidence: reading.confidence,
+                last_seen: Utc::now(),
+            },
+        );
+        Ok(())
+    }
+
+    /// Per-room mmWave corroboration, dropping readings past the freshness window.
+    fn mmwave_report(&self) -> Vec<(RoomId, MmwaveCorroboration)> {
+        self.mmwave_report_at(Utc::now())
+    }
+
+    /// mmWave report against an explicit `now` (testable without wall-clock waits).
+    pub fn mmwave_report_at(&self, now: DateTime<Utc>) -> Vec<(RoomId, MmwaveCorroboration)> {
+        let window = self.config.mmwave_stale_secs;
+        self.mmwave
+            .iter()
+            .filter_map(|(room_id, m)| {
+                let age = (now - m.last_seen).num_seconds();
+                if !(0..=window).contains(&age) {
+                    return None;
+                }
+                Some((
+                    *room_id,
+                    MmwaveCorroboration {
+                        presence: m.presence,
+                        breathing_bpm: m.breathing_bpm,
+                        heart_rate_bpm: m.heart_rate_bpm,
+                        distance_cm: m.distance_cm,
+                        targets: m.targets,
+                        confidence: m.confidence,
+                        age_secs: age,
+                    },
+                ))
+            })
+            .collect()
     }
 
     /// Record that a set of sensor nodes just reported (from a reading or CSI
@@ -332,6 +412,7 @@ impl TacticalEngine {
             contacts,
             &occupancy,
             self.sensor_report(),
+            &self.mmwave_report(),
         )
     }
 
@@ -485,6 +566,56 @@ mod tests {
         let report = engine.sensor_report();
         assert_eq!(report.len(), 3);
         assert!(report.iter().all(|s| !s.reporting && s.age_secs.is_none()));
+    }
+
+    fn mmwave_reading(name: &str, presence: bool, br: Option<f32>) -> crate::domain::reading::MmwaveReading {
+        crate::domain::reading::MmwaveReading {
+            room_id: None,
+            room_name: Some(name.into()),
+            presence,
+            breathing_bpm: br,
+            heart_rate_bpm: Some(70.0),
+            distance_cm: Some(300.0),
+            targets: 1,
+            confidence: 90,
+        }
+    }
+
+    #[test]
+    fn mmwave_corroborates_a_csi_contact() {
+        let (structure, id) = structure_with_triangulable_room();
+        let mut engine = TacticalEngine::new(structure);
+        engine.ingest(reading_for(id, vec![])).unwrap(); // CSI contact
+        engine.apply_mmwave(&mmwave_reading("Den", true, Some(15.0))).unwrap();
+        let pic = engine.picture();
+        let room = pic.rooms.iter().find(|r| r.room_id == id).unwrap();
+        assert!(room.mmwave.is_some());
+        assert!(room.corroborated, "CSI contact + mmWave presence => corroborated");
+        assert_eq!(room.mmwave.as_ref().unwrap().breathing_bpm, Some(15.0));
+    }
+
+    #[test]
+    fn mmwave_clear_with_csi_contact_is_not_corroborated() {
+        let (structure, id) = structure_with_triangulable_room();
+        let mut engine = TacticalEngine::new(structure);
+        engine.ingest(reading_for(id, vec![])).unwrap();
+        engine.apply_mmwave(&mmwave_reading("Den", false, None)).unwrap();
+        let pic = engine.picture();
+        let room = pic.rooms.iter().find(|r| r.room_id == id).unwrap();
+        assert!(room.mmwave.is_some());
+        assert!(!room.corroborated, "mmWave 'clear' must not corroborate");
+    }
+
+    #[test]
+    fn stale_mmwave_drops_from_picture() {
+        let (structure, id) = structure_with_triangulable_room();
+        let mut engine = TacticalEngine::new(structure);
+        engine.apply_mmwave(&mmwave_reading("Den", true, Some(15.0))).unwrap();
+        // Fresh now: present.
+        assert_eq!(engine.mmwave_report_at(Utc::now()).len(), 1);
+        // Far-future: stale, dropped.
+        assert!(engine.mmwave_report_at(Utc::now() + Duration::seconds(3600)).is_empty());
+        let _ = id;
     }
 
     #[test]

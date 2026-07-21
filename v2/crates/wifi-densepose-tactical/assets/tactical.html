@@ -50,6 +50,11 @@
   .pri.active { background: rgba(255,90,60,.18); color: var(--active); }
   .pri.monitor { background: rgba(255,176,32,.15); color: var(--restless); }
   .pri.no_contact { background: rgba(125,142,160,.12); color: var(--faint); }
+  .mmw { display: inline-block; font-size: 10px; letter-spacing: .04em; padding: 2px 6px;
+    border-radius: 3px; margin-top: 4px; font-weight: 700; }
+  .mmw.ok { background: rgba(47,224,138,.16); color: var(--focus); }
+  .mmw.only { background: rgba(122,140,255,.16); color: #9db4ff; }
+  .mmw.conflict { background: rgba(255,176,32,.18); color: var(--restless); }
   .legend { display: flex; flex-wrap: wrap; gap: 10px 14px; font-size: 11px;
     color: var(--muted); padding: 8px 16px; background: var(--panel);
     border-top: 1px solid var(--line); }
@@ -228,6 +233,8 @@ function renderPanels() {
   }
   if (entry) {
     document.getElementById('summary').textContent = entry.summary;
+    const occ = {};
+    if (picture) for (const o of picture.rooms) occ[o.room_id] = o;
     const host = document.getElementById('rooms');
     host.innerHTML = '';
     for (const r of entry.rooms) {
@@ -237,10 +244,11 @@ function renderPanels() {
         '<div class="top"><span class="name"></span>' +
         '<span class="pri ' + r.priority + '">' + r.priority.replace('_',' ') + '</span></div>' +
         '<div class="count">est. <b></b> · ' + (r.localizable ? 'point fix' : 'room-level') + '</div>' +
-        '<div class="why"></div>';
+        '<div class="why"></div><div class="mmw-slot"></div>';
       el.querySelector('.name').textContent = r.room_name;
       el.querySelector('.count b').textContent = r.occupancy_estimate;
       el.querySelector('.why').textContent = r.rationale;
+      renderMmwBadge(el.querySelector('.mmw-slot'), occ[r.room_id]);
       host.appendChild(el);
     }
   }
@@ -276,6 +284,31 @@ function renderSensors(picture) {
     el.querySelector('.meta').textContent = [rssi, age].filter(Boolean).join('  ·  ');
     host.appendChild(el);
   }
+}
+
+function renderMmwBadge(slot, o) {
+  slot.innerHTML = '';
+  if (!o || !o.mmwave) return;
+  const m = o.mmwave;
+  const vitals = [
+    m.breathing_bpm != null ? Math.round(m.breathing_bpm) + ' br' : null,
+    m.heart_rate_bpm != null ? Math.round(m.heart_rate_bpm) + ' hr' : null,
+    m.distance_cm != null ? Math.round(m.distance_cm / 100 * 10) / 10 + ' m' : null,
+  ].filter(Boolean).join(' · ');
+  let cls, label;
+  if (o.corroborated) {
+    cls = 'ok'; label = '✓ mmWave corroborated';
+  } else if (o.contact_count > 0 && !m.presence) {
+    cls = 'conflict'; label = '⚠ mmWave: clear (CSI contact)';
+  } else if (o.contact_count === 0 && m.presence) {
+    cls = 'only'; label = 'mmWave presence (no CSI)';
+  } else {
+    cls = 'only'; label = 'mmWave';
+  }
+  const el = document.createElement('span');
+  el.className = 'mmw ' + cls;
+  el.textContent = vitals ? label + ' · ' + vitals : label;
+  slot.appendChild(el);
 }
 
 function renderBle(picture) {

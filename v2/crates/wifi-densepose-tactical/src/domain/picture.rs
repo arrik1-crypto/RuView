@@ -26,6 +26,34 @@ pub struct RoomOccupancy {
     pub any_moving: bool,
     /// Whether the room has sensor geometry for a point fix.
     pub localizable: bool,
+    /// Latest mmWave (ESP32-C6 / MR60BHA2) reading for this room, if a mmWave
+    /// node covers it and reported recently. Independent physics from WiFi CSI.
+    #[serde(default)]
+    pub mmwave: Option<MmwaveCorroboration>,
+    /// `true` when BOTH the CSI mesh (a contact here) AND a fresh mmWave reading
+    /// agree that the room is occupied — the strongest presence evidence.
+    #[serde(default)]
+    pub corroborated: bool,
+}
+
+/// An independent mmWave vital-sign reading for a room, used to corroborate (or
+/// contradict) the CSI-derived contact. From an ESP32-C6 + Seeed MR60BHA2 node.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MmwaveCorroboration {
+    /// mmWave says a person is present.
+    pub presence: bool,
+    /// mmWave breathing rate (breaths/min), if resolved (> 0).
+    pub breathing_bpm: Option<f32>,
+    /// mmWave heart rate (beats/min), if resolved (> 0).
+    pub heart_rate_bpm: Option<f32>,
+    /// Distance to nearest target (cm), if reported.
+    pub distance_cm: Option<f32>,
+    /// Target count from the radar.
+    pub targets: u8,
+    /// mmWave signal-quality score 0–100.
+    pub confidence: u8,
+    /// Seconds since this reading arrived.
+    pub age_secs: i64,
 }
 
 /// Health of a single sensor node, as of the snapshot.
@@ -111,12 +139,14 @@ pub const STANDING_ADVISORY: &str =
 
 impl TacticalPicture {
     /// Assemble a picture from the structure's rooms and the current contacts.
+    #[allow(clippy::too_many_arguments)]
     pub fn assemble(
         structure_name: &str,
         rooms: &[Room],
         contacts: Vec<PersonContact>,
         occupancy_by_room: &[(RoomId, u32)],
         sensors: Vec<SensorSummary>,
+        mmwave_by_room: &[(RoomId, MmwaveCorroboration)],
     ) -> Self {
         let room_rollup: Vec<RoomOccupancy> = rooms
             .iter()
@@ -129,6 +159,12 @@ impl TacticalPicture {
                     .map(|(_, n)| *n)
                     .unwrap_or(0)
                     .max(in_room.len() as u32);
+                let mmwave = mmwave_by_room
+                    .iter()
+                    .find(|(id, _)| *id == room.id)
+                    .map(|(_, m)| m.clone());
+                let corroborated =
+                    !in_room.is_empty() && mmwave.as_ref().map(|m| m.presence).unwrap_or(false);
                 RoomOccupancy {
                     room_id: room.id,
                     room_name: room.name.clone(),
@@ -140,6 +176,8 @@ impl TacticalPicture {
                         .iter()
                         .any(|c| c.motion == super::contact::Motion::Moving),
                     localizable: room.localizable(),
+                    mmwave,
+                    corroborated,
                 }
             })
             .collect();

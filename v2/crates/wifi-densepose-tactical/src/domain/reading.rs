@@ -126,6 +126,35 @@ fn classify_breathing(bpm: f32) -> BreathingType {
     }
 }
 
+/// An mmWave (ESP32-C6 / MR60BHA2) reading posted for one room, used to
+/// corroborate the CSI-derived contact with independent radar physics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MmwaveReading {
+    /// Room this reading is for (by id). Prefer this when known.
+    #[serde(default)]
+    pub room_id: Option<RoomId>,
+    /// Room this reading is for (by name). Used when `room_id` is absent.
+    #[serde(default)]
+    pub room_name: Option<String>,
+    /// Whether the radar reports a person present.
+    pub presence: bool,
+    /// mmWave breathing rate (breaths/min), if resolved.
+    #[serde(default)]
+    pub breathing_bpm: Option<f32>,
+    /// mmWave heart rate (beats/min), if resolved.
+    #[serde(default)]
+    pub heart_rate_bpm: Option<f32>,
+    /// Distance to nearest target (cm), if reported.
+    #[serde(default)]
+    pub distance_cm: Option<f32>,
+    /// Radar target count.
+    #[serde(default)]
+    pub targets: u8,
+    /// Radar signal-quality score 0–100.
+    #[serde(default)]
+    pub confidence: u8,
+}
+
 /// Resolved reading: a room id plus the vital-signs and RSSI it produced.
 #[derive(Debug, Clone)]
 pub struct RoomReading {

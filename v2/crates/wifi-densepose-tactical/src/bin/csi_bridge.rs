@@ -30,6 +30,9 @@ use wifi_densepose_hardware::{CsiFrame, Esp32CsiParser};
 /// disconnected server can't grow the buffer without bound.
 const MAX_SAMPLES: usize = 4000;
 
+/// ADR-063 edge fused-vitals packet magic (ESP32-C6 + MR60BHA2 mmWave).
+const MMWAVE_MAGIC: u32 = 0xC511_0004;
+
 fn default_server() -> String {
     "http://127.0.0.1:8099".to_string()
 }
@@ -73,7 +76,7 @@ struct NodeState {
     last_rssi: Option<f64>,
 }
 
-/// A forward-ready payload for one room.
+/// A forward-ready CSI payload for one room.
 #[derive(Debug, PartialEq)]
 struct CsiPost {
     room: String,
@@ -82,12 +85,27 @@ struct CsiPost {
     sensor_rssi: Vec<(String, f64)>,
 }
 
+/// A forward-ready mmWave corroboration payload for one room.
+#[derive(Debug, Clone, PartialEq)]
+struct MmwavePost {
+    presence: bool,
+    breathing_bpm: Option<f32>,
+    heart_rate_bpm: Option<f32>,
+    distance_cm: Option<f32>,
+    targets: u8,
+    confidence: u8,
+}
+
 /// Bridge state: node buffers + room→node index.
 struct BridgeState {
     nodes: HashMap<u8, NodeState>,
     /// Rooms in first-seen order (stable output).
     rooms: Vec<String>,
     room_nodes: HashMap<String, Vec<u8>>,
+    /// Reverse index node_id → room, for routing mmWave packets.
+    node_room: HashMap<u8, String>,
+    /// Latest mmWave reading pending forward, keyed by room.
+    mmwave_pending: HashMap<String, MmwavePost>,
 }
 
 impl BridgeState {
@@ -96,12 +114,14 @@ impl BridgeState {
         let mut rooms: Vec<String> = Vec::new();
         let mut room_nodes: HashMap<String, Vec<u8>> = HashMap::new();
 
+        let mut node_room = HashMap::new();
         for n in &cfg.nodes {
             if !rooms.contains(&n.room) {
                 rooms.push(n.room.clone());
             }
             let entry = room_nodes.entry(n.room.clone()).or_default();
             entry.push(n.node_id);
+            node_room.insert(n.node_id, n.room.clone());
             nodes.insert(
                 n.node_id,
                 NodeState {
@@ -131,12 +151,30 @@ impl BridgeState {
             nodes,
             rooms,
             room_nodes,
+            node_room,
+            mmwave_pending: HashMap::new(),
         }
     }
 
-    /// Decode a UDP datagram and fold its CSI frames into the buffers.
-    /// Returns the number of mapped frames ingested.
+    /// Decode a UDP datagram. Routes mmWave fused-vitals packets (0xC5110004) to
+    /// the pending mmWave map and everything else through the CSI parser. Returns
+    /// the number of mapped items ingested.
     fn ingest_datagram(&mut self, buf: &[u8]) -> usize {
+        // mmWave fused-vitals packet? Route it before the CSI parser (which would
+        // classify it as a sibling packet and skip it).
+        if buf.len() >= 4 {
+            let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+            if magic == MMWAVE_MAGIC {
+                if let Some((node_id, post)) = parse_fused_vitals(buf) {
+                    if let Some(room) = self.node_room.get(&node_id) {
+                        self.mmwave_pending.insert(room.clone(), post);
+                        return 1;
+                    }
+                }
+                return 0;
+            }
+        }
+
         let (frames, _consumed) = Esp32CsiParser::parse_stream(buf);
         let mut ingested = 0;
         for frame in frames {
@@ -205,6 +243,51 @@ impl BridgeState {
         }
         posts
     }
+
+    /// Take the pending mmWave readings (one per room) to forward, clearing them.
+    fn drain_mmwave(&mut self) -> Vec<(String, MmwavePost)> {
+        std::mem::take(&mut self.mmwave_pending)
+            .into_iter()
+            .collect()
+    }
+}
+
+/// Parse an ADR-063 edge fused-vitals packet (magic 0xC5110004, 48 bytes) into
+/// its node id and mmWave payload. Byte layout mirrors the firmware's
+/// `edge_fused_vitals_pkt_t` (`_Static_assert(sizeof == 48)`). Only the raw
+/// mmWave fields are used here — the fused/CSI-side estimates are the tactical
+/// engine's job.
+fn parse_fused_vitals(buf: &[u8]) -> Option<(u8, MmwavePost)> {
+    if buf.len() < 48 {
+        return None;
+    }
+    let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    if magic != MMWAVE_MAGIC {
+        return None;
+    }
+    let node_id = buf[4];
+    let flags = buf[5]; // bit0=presence, bit3=mmwave_present
+    let n_persons = buf[13];
+    let hr = f32::from_le_bytes([buf[28], buf[29], buf[30], buf[31]]);
+    let br = f32::from_le_bytes([buf[32], buf[33], buf[34], buf[35]]);
+    let dist = f32::from_le_bytes([buf[36], buf[37], buf[38], buf[39]]);
+    let targets = buf[40];
+    let confidence = buf[41];
+
+    let presence =
+        (flags & 0x01) != 0 || (flags & 0x08) != 0 || n_persons > 0 || targets > 0;
+
+    Some((
+        node_id,
+        MmwavePost {
+            presence,
+            breathing_bpm: (br > 0.0).then_some(br),
+            heart_rate_bpm: (hr > 0.0).then_some(hr),
+            distance_cm: (dist > 0.0).then_some(dist),
+            targets,
+            confidence,
+        },
+    ))
 }
 
 /// Reduce a per-subcarrier CSI frame to one `(amplitude, phase)` time sample:
@@ -238,6 +321,22 @@ fn post_to_server(agent: &ureq::Agent, url: &str, post: &CsiPost) {
     }
 }
 
+fn post_mmwave_to_server(agent: &ureq::Agent, url: &str, room: &str, post: &MmwavePost) {
+    let body = serde_json::json!({
+        "room_name": room,
+        "presence": post.presence,
+        "breathing_bpm": post.breathing_bpm,
+        "heart_rate_bpm": post.heart_rate_bpm,
+        "distance_cm": post.distance_cm,
+        "targets": post.targets,
+        "confidence": post.confidence,
+    });
+    match agent.post(url).send_json(body) {
+        Ok(_) => {}
+        Err(e) => eprintln!("[csi-bridge] POST {url} failed: {e}"),
+    }
+}
+
 fn main() {
     let config_path = std::env::args().nth(1).unwrap_or_else(|| "csi-bridge.json".to_string());
     if config_path == "--help" || config_path == "-h" {
@@ -258,7 +357,9 @@ fn main() {
         }
     };
 
-    let csi_url = format!("{}/api/csi", cfg.server.trim_end_matches('/'));
+    let base = cfg.server.trim_end_matches('/');
+    let csi_url = format!("{base}/api/csi");
+    let mmwave_url = format!("{base}/api/mmwave");
     let state = Arc::new(Mutex::new(BridgeState::from_config(&cfg)));
 
     let socket = match UdpSocket::bind(&cfg.listen) {
@@ -271,7 +372,8 @@ fn main() {
 
     let room_count = { state.lock().unwrap().rooms.len() };
     eprintln!("[csi-bridge] listening for ESP32 CSI on udp://{}", cfg.listen);
-    eprintln!("[csi-bridge] forwarding to {csi_url}");
+    eprintln!("[csi-bridge] forwarding CSI to {csi_url}");
+    eprintln!("[csi-bridge] forwarding mmWave to {mmwave_url}");
     eprintln!(
         "[csi-bridge] {} node(s) across {room_count} room(s), flush every {} ms",
         cfg.nodes.len(),
@@ -305,9 +407,15 @@ fn main() {
     let flush = Duration::from_millis(cfg.flush_ms.max(100));
     loop {
         std::thread::sleep(flush);
-        let posts = { state.lock().unwrap().drain_posts() };
+        let (posts, mmwave) = {
+            let mut s = state.lock().unwrap();
+            (s.drain_posts(), s.drain_mmwave())
+        };
         for post in &posts {
             post_to_server(&agent, &csi_url, post);
+        }
+        for (room, post) in &mmwave {
+            post_mmwave_to_server(&agent, &mmwave_url, room, post);
         }
     }
 }
@@ -405,6 +513,47 @@ mod tests {
         let mut state = BridgeState::from_config(&config());
         let n = state.ingest_datagram(&frame_bytes(99, -50, &[(10, 10)]));
         assert_eq!(n, 0, "frames from unknown nodes are ignored");
+    }
+
+    /// Build a 48-byte ADR-063 fused-vitals packet with mmWave HR/BR set.
+    fn fused_vitals_bytes(node_id: u8, flags: u8, hr: f32, br: f32, dist: f32, targets: u8) -> Vec<u8> {
+        let mut buf = vec![0u8; 48];
+        buf[0..4].copy_from_slice(&0xC511_0004u32.to_le_bytes());
+        buf[4] = node_id;
+        buf[5] = flags;
+        buf[28..32].copy_from_slice(&hr.to_le_bytes());
+        buf[32..36].copy_from_slice(&br.to_le_bytes());
+        buf[36..40].copy_from_slice(&dist.to_le_bytes());
+        buf[40] = targets;
+        buf[41] = 90; // confidence
+        buf
+    }
+
+    #[test]
+    fn mmwave_packet_routes_to_pending() {
+        let mut state = BridgeState::from_config(&config());
+        // node 1 is in "Den"; presence flag set, HR 72, BR 15, 1 target.
+        let pkt = fused_vitals_bytes(1, 0x01, 72.0, 15.0, 320.0, 1);
+        let n = state.ingest_datagram(&pkt);
+        assert_eq!(n, 1);
+        let drained = state.drain_mmwave();
+        assert_eq!(drained.len(), 1);
+        let (room, post) = &drained[0];
+        assert_eq!(room, "Den");
+        assert!(post.presence);
+        assert_eq!(post.breathing_bpm, Some(15.0));
+        assert_eq!(post.heart_rate_bpm, Some(72.0));
+        assert_eq!(post.distance_cm, Some(320.0));
+        // Draining clears it.
+        assert!(state.drain_mmwave().is_empty());
+    }
+
+    #[test]
+    fn mmwave_from_unmapped_node_is_dropped() {
+        let mut state = BridgeState::from_config(&config());
+        let pkt = fused_vitals_bytes(99, 0x01, 72.0, 15.0, 320.0, 1);
+        assert_eq!(state.ingest_datagram(&pkt), 0);
+        assert!(state.drain_mmwave().is_empty());
     }
 
     #[test]

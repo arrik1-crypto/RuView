@@ -208,5 +208,10 @@ ESP32-S3 nodes ──ADR-018 CSI over UDP──▶ ruview-csi-bridge ──POST 
 - **CSI mesh** = the only path that senses *people* through walls.
 - **BLE overlay** = the phone's own radio; detects *transmitting devices*, never
   people. Auxiliary, clearly separated, never on the floor plan.
-- **mmWave (ESP32-C6/MR60BHA2)** = optional independent corroboration on the
-  priority room (see `wifi-densepose-vitals`).
+- **mmWave (ESP32-C6/MR60BHA2)** = independent corroboration on the priority
+  room. The C6 node emits an ADR-063 fused-vitals packet (`0xC5110004`) on the
+  same UDP port as CSI; `ruview-csi-bridge` decodes it automatically and forwards
+  to `POST /api/mmwave`. Map the C6's `node_id` to the room in the bridge config
+  like any other node. The dashboard then shows a per-room badge:
+  **✓ mmWave corroborated** (CSI + radar agree), **⚠ mmWave: clear (CSI contact)**
+  (they disagree — investigate), or **mmWave presence (no CSI)**.
