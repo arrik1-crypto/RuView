@@ -12,6 +12,7 @@
 //! enhancement stays off, so detection is the pure signal-processing path.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use wifi_densepose_mat::domain::VitalSignsReading;
 use wifi_densepose_mat::{DetectionConfig, DetectionPipeline};
@@ -23,17 +24,41 @@ use crate::error::TacticalError;
 /// frames/sec; MAT needs ~5 s of data before it will report a detection.
 pub const DEFAULT_CSI_SAMPLE_RATE: f64 = 100.0;
 
-/// Per-room CSI accumulation + detection.
-struct RoomIngest {
+/// Per-room CSI accumulation + detection. Held behind an `Arc` so a caller can
+/// clone the handle out from under the ingest map lock and run the (async)
+/// detection without blocking structure rebuilds or other rooms' pushes.
+pub struct RoomIngest {
     pipeline: DetectionPipeline,
     zone: wifi_densepose_mat::domain::ScanZone,
+}
+
+impl RoomIngest {
+    /// Buffer a CSI chunk. Rejects (returns `false`, ingesting nothing) when
+    /// `amplitudes` and `phases` differ in length — MAT's buffer keeps the two
+    /// series in lockstep and a mismatch would later panic its ring-buffer
+    /// trim. This is the wire-boundary guard against a malformed `/api/csi` body.
+    pub fn push(&self, amplitudes: &[f64], phases: &[f64]) -> bool {
+        if amplitudes.len() != phases.len() {
+            return false;
+        }
+        self.pipeline.add_data(amplitudes, phases);
+        true
+    }
+
+    /// Distil the buffered CSI into a vital-signs reading.
+    pub async fn distill(&self) -> Result<Option<VitalSignsReading>, TacticalError> {
+        self.pipeline
+            .process_zone(&self.zone)
+            .await
+            .map_err(|e| TacticalError::Invalid(format!("detection failed: {e}")))
+    }
 }
 
 /// Holds one MAT detection pipeline per room and distils buffered CSI into
 /// vital-signs readings.
 pub struct CsiIngest {
     sample_rate: f64,
-    rooms: HashMap<RoomId, RoomIngest>,
+    rooms: HashMap<RoomId, Arc<RoomIngest>>,
 }
 
 impl CsiIngest {
@@ -51,16 +76,18 @@ impl CsiIngest {
     pub fn rebuild(&mut self, structure: &Structure) {
         self.rooms.clear();
         for room in &structure.rooms {
-            let mut config = DetectionConfig::default();
-            config.sample_rate = self.sample_rate;
+            let config = DetectionConfig {
+                sample_rate: self.sample_rate,
+                ..Default::default()
+            };
             self.rooms.insert(
                 room.id,
-                RoomIngest {
+                Arc::new(RoomIngest {
                     pipeline: DetectionPipeline::new(config),
                     // Detection ignores geometry; a sensor-less zone is fine here.
                     // Localization uses the frame's RSSI later, in the engine.
                     zone: room.to_scan_zone(&[]),
-                },
+                }),
             );
         }
     }
@@ -70,14 +97,19 @@ impl CsiIngest {
         self.rooms.contains_key(&room_id)
     }
 
-    /// Push a CSI frame (amplitude + unwrapped phase samples) for a room.
-    /// Returns `false` if the room is unknown.
+    /// Clone out a room's ingest handle. The caller can then push + distill
+    /// without holding the ingest map lock across the (async) detection — so a
+    /// concurrent structure rebuild or another room's push never stalls behind
+    /// one room's DSP.
+    pub fn room(&self, room_id: RoomId) -> Option<Arc<RoomIngest>> {
+        self.rooms.get(&room_id).cloned()
+    }
+
+    /// Push a CSI frame for a room. Returns `false` if the room is unknown or
+    /// the amplitude/phase lengths disagree (see [`RoomIngest::push`]).
     pub fn push(&self, room_id: RoomId, amplitudes: &[f64], phases: &[f64]) -> bool {
         match self.rooms.get(&room_id) {
-            Some(r) => {
-                r.pipeline.add_data(amplitudes, phases);
-                true
-            }
+            Some(r) => r.push(amplitudes, phases),
             None => false,
         }
     }
@@ -91,11 +123,9 @@ impl CsiIngest {
         let room = self
             .rooms
             .get(&room_id)
+            .cloned()
             .ok_or_else(|| TacticalError::UnknownRoom(room_id.to_string()))?;
-        room.pipeline
-            .process_zone(&room.zone)
-            .await
-            .map_err(|e| TacticalError::Invalid(format!("detection failed: {e}")))
+        room.distill().await
     }
 }
 
@@ -142,6 +172,16 @@ mod tests {
         let phases = vec![0.0_f64; 100];
         ingest.push(id, &amps, &phases);
         assert!(ingest.distill(id).await.unwrap().is_none());
+    }
+
+    #[test]
+    fn mismatched_amp_phase_lengths_are_rejected() {
+        let (s, id) = structure();
+        let ingest = CsiIngest::from_structure(&s, 100.0);
+        // Would otherwise poison MAT's buffer and panic on the next trim.
+        assert!(!ingest.push(id, &vec![0.1; 4000], &[]));
+        // A matched push still works.
+        assert!(ingest.push(id, &[0.1_f64; 10], &[0.0_f64; 10]));
     }
 
     #[tokio::test]

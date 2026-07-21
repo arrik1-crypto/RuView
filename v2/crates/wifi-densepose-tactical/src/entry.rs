@@ -7,8 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::domain::contact::{LifeSign, Motion};
-use crate::domain::picture::TacticalPicture;
+use crate::domain::contact::{LifeSign, Motion, PersonContact};
+use crate::domain::picture::{RoomOccupancy, TacticalPicture};
 use crate::domain::structure::RoomId;
 
 /// Relative attention a room warrants, based purely on presence + motion.
@@ -102,20 +102,28 @@ impl EntryAdvisor {
                     .filter(|c| c.room_id == room.room_id)
                     .collect();
 
-                let priority = if in_room.is_empty() {
-                    TacticalPriority::NoContact
-                } else if in_room.iter().any(|c| c.motion == Motion::Moving) {
-                    TacticalPriority::Active
-                } else if in_room
-                    .iter()
-                    .all(|c| c.life_sign == LifeSign::Faint)
-                {
-                    TacticalPriority::Monitor
-                } else {
+                let mmwave_present =
+                    room.mmwave.as_ref().map(|m| m.presence).unwrap_or(false);
+
+                let priority = if !in_room.is_empty() {
+                    if in_room.iter().any(|c| c.motion == Motion::Moving) {
+                        TacticalPriority::Active
+                    } else if in_room.iter().all(|c| c.life_sign == LifeSign::Faint) {
+                        TacticalPriority::Monitor
+                    } else {
+                        TacticalPriority::Focus
+                    }
+                } else if mmwave_present {
+                    // Independent radar detects a person the CSI mesh cannot see
+                    // (e.g. perfectly still, behind heavy construction). This is a
+                    // real positive detection — it must never read as NoContact,
+                    // and in a rescue context it warrants top attention.
                     TacticalPriority::Focus
+                } else {
+                    TacticalPriority::NoContact
                 };
 
-                let rationale = Self::rationale(priority, &in_room, room.occupancy_estimate, room.localizable);
+                let rationale = Self::rationale(priority, &in_room, room);
 
                 RoomAssessment {
                     room_id: room.room_id,
@@ -144,29 +152,46 @@ impl EntryAdvisor {
     }
 
     fn summary(picture: &TacticalPicture) -> String {
-        if picture.occupied_rooms == 0 {
+        let mmwave_only = picture
+            .rooms
+            .iter()
+            .filter(|r| {
+                r.contact_count == 0 && r.mmwave.as_ref().map(|m| m.presence).unwrap_or(false)
+            })
+            .count();
+
+        if picture.occupied_rooms == 0 && mmwave_only == 0 {
             return "No presence detected anywhere in the structure. This does NOT \
                     confirm it is empty — verify by other means."
                 .to_string();
         }
-        format!(
-            "~{} person(s) sensed across {} room(s). Presence and motion only — \
-             no identity or threat assessment.",
+
+        let mut s = format!(
+            "~{} person(s) sensed by CSI across {} room(s). Presence and motion \
+             only — no identity or threat assessment.",
             picture.total_occupancy_estimate, picture.occupied_rooms
-        )
+        );
+        if mmwave_only > 0 {
+            s.push_str(&format!(
+                " PLUS {mmwave_only} room(s) where mmWave radar detects a person the \
+                 CSI mesh does NOT — investigate."
+            ));
+        }
+        s
     }
 
     fn rationale(
         priority: TacticalPriority,
-        in_room: &[&crate::domain::contact::PersonContact],
-        occupancy: u32,
-        localizable: bool,
+        in_room: &[&PersonContact],
+        room: &RoomOccupancy,
     ) -> String {
-        let loc = if localizable {
+        let occupancy = room.occupancy_estimate;
+        let loc = if room.localizable {
             "point-localized"
         } else {
             "room-level presence only (add sensors for a point fix)"
         };
+
         match priority {
             TacticalPriority::NoContact => {
                 "No contact. Absence is not proof of an empty room.".to_string()
@@ -175,6 +200,19 @@ impl EntryAdvisor {
                 "~{occupancy} contact(s), at least one MOVING — mobile subject, \
                  picture will change; {loc}."
             ),
+            // mmWave-only positive detection with no CSI contact.
+            TacticalPriority::Focus if in_room.is_empty() => {
+                let vitals = room
+                    .mmwave
+                    .as_ref()
+                    .and_then(|m| m.breathing_bpm)
+                    .map(|b| format!(", ~{} br", b.round() as i32))
+                    .unwrap_or_default();
+                format!(
+                    "mmWave radar detects a person here{vitals} that the CSI mesh does \
+                     NOT — likely very still and/or behind heavy construction. Corroborate."
+                )
+            }
             TacticalPriority::Focus => {
                 let breathing = in_room
                     .iter()
@@ -184,9 +222,21 @@ impl EntryAdvisor {
                 } else {
                     "movement-based presence"
                 };
+                // Report the actual motion mix, not a hardcoded "stationary".
+                let any_restless = in_room.iter().any(|c| c.motion == Motion::Restless);
+                let motion = if any_restless {
+                    "mostly stationary (some fidgeting)"
+                } else {
+                    "stationary"
+                };
+                let corr = if room.corroborated {
+                    " [mmWave corroborated]"
+                } else {
+                    ""
+                };
                 format!(
-                    "~{occupancy} STATIONARY contact(s), {life} — people staying put \
-                     (held persons or barricaded subject; sensor cannot tell); {loc}."
+                    "~{occupancy} {motion} contact(s), {life} — people staying put \
+                     (held persons or barricaded subject; sensor cannot tell); {loc}.{corr}"
                 )
             }
             TacticalPriority::Monitor => format!(
@@ -228,6 +278,30 @@ mod tests {
             sensor_rssi: vec![],
         };
         engine.ingest(reading).unwrap();
+    }
+
+    #[test]
+    fn mmwave_only_presence_is_not_no_contact() {
+        let (mut engine, bid, _) = engine_with_two_rooms();
+        // Radar sees a still person the CSI mesh missed; no CSI contact created.
+        engine
+            .apply_mmwave(&crate::domain::reading::MmwaveReading {
+                room_id: Some(bid),
+                room_name: None,
+                presence: true,
+                breathing_bpm: Some(14.0),
+                heart_rate_bpm: Some(65.0),
+                distance_cm: Some(280.0),
+                targets: 1,
+                confidence: 85,
+            })
+            .unwrap();
+        let rec = EntryAdvisor::assess(&engine.picture());
+        let bedroom = rec.rooms.iter().find(|r| r.room_id == bid).unwrap();
+        assert_ne!(bedroom.priority, TacticalPriority::NoContact, "mmWave presence must not read as NoContact");
+        assert_eq!(bedroom.priority, TacticalPriority::Focus);
+        assert!(rec.summary.contains("mmWave"), "summary must surface mmWave-only detection");
+        assert!(bedroom.rationale.contains("mmWave"));
     }
 
     #[test]

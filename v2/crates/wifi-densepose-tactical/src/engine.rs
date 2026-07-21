@@ -287,9 +287,20 @@ impl TacticalEngine {
 
         match self.contacts.get_mut(&room.id) {
             Some(existing) => {
-                let a = self.config.position_alpha;
-                existing.x = existing.x * (1.0 - a) + x * a;
-                existing.y = existing.y * (1.0 - a) + y * a;
+                // Only EMA-smooth when the fix TYPE is unchanged. On a transition
+                // (room centroid <-> triangulated point fix) the old and new
+                // coordinates mean different things; blending them would report a
+                // position that its stated uncertainty_radius_m / point_fix no
+                // longer describes (e.g. a tight 0.4 m "95% radius" around a point
+                // halfway to the room centroid). Snap to the new fix instead.
+                if existing.point_fix == point_fix {
+                    let a = self.config.position_alpha;
+                    existing.x = existing.x * (1.0 - a) + x * a;
+                    existing.y = existing.y * (1.0 - a) + y * a;
+                } else {
+                    existing.x = x;
+                    existing.y = y;
+                }
                 existing.point_fix = point_fix;
                 existing.uncertainty_radius_m = uncertainty;
                 existing.motion = motion;
@@ -502,6 +513,34 @@ mod tests {
         let pic = engine.picture();
         assert_eq!(pic.contacts.len(), 1);
         assert!(pic.contacts[0].point_fix, "3 RSSI sensors => point fix");
+    }
+
+    #[test]
+    fn point_fix_after_centroid_snaps_not_blends() {
+        let rssi = vec![
+            SensorRssi { id: "s1".into(), rssi: -55.0 },
+            SensorRssi { id: "s2".into(), rssi: -60.0 },
+            SensorRssi { id: "s3".into(), rssi: -58.0 },
+        ];
+        // Engine A: a fresh point fix (no prior contact).
+        let (sa, ida) = structure_with_triangulable_room();
+        let mut a = TacticalEngine::new(sa);
+        a.ingest(reading_for(ida, rssi.clone())).unwrap();
+        let pa = a.picture().contacts[0].clone();
+        // Engine B: room-level centroid first, THEN the same point fix.
+        let (sb, idb) = structure_with_triangulable_room();
+        let mut b = TacticalEngine::new(sb);
+        b.ingest(reading_for(idb, vec![])).unwrap();
+        b.ingest(reading_for(idb, rssi)).unwrap();
+        let pb = b.picture().contacts[0].clone();
+        assert!(pb.point_fix);
+        // The transition must adopt the fresh point-fix position, not a blend of
+        // the stale centroid — otherwise (x,y) wouldn't match the tight radius.
+        assert!(
+            (pa.x - pb.x).abs() < 1e-9 && (pa.y - pb.y).abs() < 1e-9,
+            "centroid->point-fix must snap: fresh=({},{}) transitioned=({},{})",
+            pa.x, pa.y, pb.x, pb.y
+        );
     }
 
     #[test]

@@ -98,18 +98,21 @@ class BleScanner(private val context: Context, private val port: Int) {
     }
 
     private fun postJson(body: String) {
+        var conn: HttpURLConnection? = null
         try {
-            val conn = URL("http://127.0.0.1:$port/api/ble").openConnection() as HttpURLConnection
-            conn.requestMethod = "POST"
-            conn.doOutput = true
-            conn.connectTimeout = 2000
-            conn.readTimeout = 2000
-            conn.setRequestProperty("Content-Type", "application/json")
+            conn = (URL("http://127.0.0.1:$port/api/ble").openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                doOutput = true
+                connectTimeout = 2000
+                readTimeout = 2000
+                setRequestProperty("Content-Type", "application/json")
+            }
             conn.outputStream.use { it.write(body.toByteArray()) }
             conn.responseCode
-            conn.disconnect()
         } catch (_: Exception) {
             // Server not up yet or transient — the next flush retries.
+        } finally {
+            conn?.disconnect()
         }
     }
 

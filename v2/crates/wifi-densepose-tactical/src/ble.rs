@@ -14,6 +14,13 @@ use chrono::{DateTime, Utc};
 
 use crate::domain::picture::BleDevice;
 
+/// Max BLE devices tracked at once (bounds memory against a spoofed-address flood).
+pub const MAX_DEVICES: usize = 512;
+/// Max device-id length kept.
+const MAX_ID_LEN: usize = 64;
+/// Max advertised-name length kept.
+const MAX_NAME_LEN: usize = 64;
+
 /// One BLE observation reported by the phone scanner.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct BleObservation {
@@ -62,19 +69,51 @@ impl BleTracker {
     }
 
     /// Record a batch of observations (from one scan flush).
+    ///
+    /// Bounded against a hostile/spoofed `/api/ble` flood: ids and names are
+    /// length-clamped, and the tracked set is capped at [`MAX_DEVICES`] by
+    /// evicting the weakest-signal device (the closest devices are what matter).
     pub fn observe(&mut self, obs: &[BleObservation]) {
         let now = Utc::now();
         for o in obs {
-            let entry = self.devices.entry(o.id.clone()).or_insert(DeviceState {
-                name: o.name.clone(),
-                rssi: o.rssi,
-                last_seen: now,
-            });
-            entry.rssi = o.rssi;
-            entry.last_seen = now;
-            if o.name.is_some() {
-                entry.name = o.name.clone();
+            let id: String = o.id.chars().take(MAX_ID_LEN).collect();
+            let name = o
+                .name
+                .as_ref()
+                .map(|n| n.chars().take(MAX_NAME_LEN).collect::<String>());
+
+            if let Some(entry) = self.devices.get_mut(&id) {
+                entry.rssi = o.rssi;
+                entry.last_seen = now;
+                if name.is_some() {
+                    entry.name = name;
+                }
+                continue;
             }
+
+            // New device: enforce the cap by evicting the weakest tracked signal;
+            // if the newcomer is weaker than everything tracked, drop it instead.
+            if self.devices.len() >= MAX_DEVICES {
+                if let Some((weak_id, weak_rssi)) = self
+                    .devices
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.rssi))
+                    .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                {
+                    if o.rssi <= weak_rssi {
+                        continue;
+                    }
+                    self.devices.remove(&weak_id);
+                }
+            }
+            self.devices.insert(
+                id,
+                DeviceState {
+                    name,
+                    rssi: o.rssi,
+                    last_seen: now,
+                },
+            );
         }
     }
 
@@ -181,6 +220,31 @@ mod tests {
         assert_eq!(t.len(), 1);
         t.prune_at(Utc::now() + Duration::seconds(3600));
         assert_eq!(t.len(), 0);
+    }
+
+    #[test]
+    fn device_map_is_capped_and_keeps_strongest() {
+        let mut t = BleTracker::new();
+        // Flood with more than the cap; rssi increases with index (stronger).
+        for i in 0..(MAX_DEVICES + 200) {
+            t.observe(&[obs(&format!("dev-{i}"), None, -120.0 + i as f64 * 0.01)]);
+        }
+        assert!(t.len() <= MAX_DEVICES, "device map must stay bounded");
+        // The strongest (highest-index) device survived; the weakest did not.
+        let snap = t.snapshot();
+        assert!(snap.iter().any(|d| d.id == format!("dev-{}", MAX_DEVICES + 199)));
+        assert!(!snap.iter().any(|d| d.id == "dev-0"));
+    }
+
+    #[test]
+    fn long_id_and_name_are_truncated() {
+        let mut t = BleTracker::new();
+        let long = "x".repeat(500);
+        t.observe(&[obs(&long, Some(&long), -50.0)]);
+        let snap = t.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert!(snap[0].id.len() <= 64);
+        assert!(snap[0].name.as_ref().unwrap().len() <= 64);
     }
 
     #[test]

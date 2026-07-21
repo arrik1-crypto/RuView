@@ -18,10 +18,10 @@
 //! RSSI for localization. This is presence + coarse location, not validated
 //! accuracy — see the crate root safety notes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::UdpSocket;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use wifi_densepose_hardware::{CsiFrame, Esp32CsiParser};
@@ -67,13 +67,19 @@ struct Config {
     nodes: Vec<NodeCfg>,
 }
 
+/// How long a node's last RSSI stays usable for localization before it is
+/// treated as stale and dropped from forwarded readings.
+const RSSI_STALE: Duration = Duration::from_secs(5);
+
 /// Live per-node accumulation. (Room membership lives in `room_nodes`.)
 struct NodeState {
     sensor_id: String,
     is_primary: bool,
     amps: Vec<f64>,
     phases: Vec<f64>,
-    last_rssi: Option<f64>,
+    /// Last RSSI and when it arrived — aged out after `RSSI_STALE` so a node
+    /// that stops reporting doesn't forward a phantom "current" value forever.
+    last_rssi: Option<(f64, Instant)>,
 }
 
 /// A forward-ready CSI payload for one room.
@@ -106,6 +112,10 @@ struct BridgeState {
     node_room: HashMap<u8, String>,
     /// Latest mmWave reading pending forward, keyed by room.
     mmwave_pending: HashMap<String, MmwavePost>,
+    /// Rooms that received at least one node frame since the last drain — so an
+    /// RSSI-only update is forwarded when a node reported but the primary had no
+    /// CSI, without re-emitting unchanged RSSI on idle flushes.
+    dirty_rooms: HashSet<String>,
 }
 
 impl BridgeState {
@@ -134,11 +144,23 @@ impl BridgeState {
             );
         }
 
-        // Ensure each room has exactly one primary: if none was flagged, the
-        // first node listed for the room becomes primary.
+        // Enforce EXACTLY one primary per room: demote any extra primaries (whose
+        // CSI would otherwise be silently discarded at drain time), and if none
+        // was flagged, promote the first node listed.
         for ids in room_nodes.values() {
-            let has_primary = ids.iter().any(|id| nodes[id].is_primary);
-            if !has_primary {
+            let mut seen_primary = false;
+            for id in ids {
+                if let Some(ns) = nodes.get_mut(id) {
+                    if ns.is_primary {
+                        if seen_primary {
+                            ns.is_primary = false;
+                        } else {
+                            seen_primary = true;
+                        }
+                    }
+                }
+            }
+            if !seen_primary {
                 if let Some(first) = ids.first() {
                     if let Some(ns) = nodes.get_mut(first) {
                         ns.is_primary = true;
@@ -153,6 +175,7 @@ impl BridgeState {
             room_nodes,
             node_room,
             mmwave_pending: HashMap::new(),
+            dirty_rooms: HashSet::new(),
         }
     }
 
@@ -166,8 +189,29 @@ impl BridgeState {
             let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
             if magic == MMWAVE_MAGIC {
                 if let Some((node_id, post)) = parse_fused_vitals(buf) {
-                    if let Some(room) = self.node_room.get(&node_id) {
-                        self.mmwave_pending.insert(room.clone(), post);
+                    if let Some(room) = self.node_room.get(&node_id).cloned() {
+                        // AGGREGATE within a flush window rather than last-write-wins,
+                        // so a presence hit is never clobbered by a later "clear"
+                        // packet (from the same node or a second node in the room).
+                        self.mmwave_pending
+                            .entry(room)
+                            .and_modify(|e| {
+                                e.presence |= post.presence;
+                                e.targets = e.targets.max(post.targets);
+                                e.confidence = e.confidence.max(post.confidence);
+                                if post.presence {
+                                    if post.breathing_bpm.is_some() {
+                                        e.breathing_bpm = post.breathing_bpm;
+                                    }
+                                    if post.heart_rate_bpm.is_some() {
+                                        e.heart_rate_bpm = post.heart_rate_bpm;
+                                    }
+                                    if post.distance_cm.is_some() {
+                                        e.distance_cm = post.distance_cm;
+                                    }
+                                }
+                            })
+                            .or_insert(post);
                         return 1;
                     }
                 }
@@ -179,20 +223,31 @@ impl BridgeState {
         let mut ingested = 0;
         for frame in frames {
             let node_id = frame.metadata.node_id;
-            let Some(ns) = self.nodes.get_mut(&node_id) else {
-                continue; // node not in the floor-plan config — skip
+            // Resolve the room first (immutable borrow) so we can mark it dirty
+            // after the mutable node borrow ends. Unmapped nodes are skipped here.
+            let room = match self.node_room.get(&node_id) {
+                Some(r) => r.clone(),
+                None => continue,
             };
-            ns.last_rssi = Some(frame.metadata.rssi_dbm as f64);
-            if ns.is_primary {
-                let (amp, phase) = reduce_frame(&frame);
-                ns.amps.push(amp);
-                ns.phases.push(phase);
-                if ns.amps.len() > MAX_SAMPLES {
-                    let drop = ns.amps.len() - MAX_SAMPLES;
-                    ns.amps.drain(0..drop);
-                    ns.phases.drain(0..drop);
+            {
+                let Some(ns) = self.nodes.get_mut(&node_id) else {
+                    continue;
+                };
+                ns.last_rssi = Some((frame.metadata.rssi_dbm as f64, Instant::now()));
+                // Skip degenerate zero-subcarrier frames: they reduce to a
+                // (0.0, 0.0) sample that would poison the breathing/amplitude series.
+                if ns.is_primary && frame.subcarrier_count() > 0 {
+                    let (amp, phase) = reduce_frame(&frame);
+                    ns.amps.push(amp);
+                    ns.phases.push(phase);
+                    if ns.amps.len() > MAX_SAMPLES {
+                        let drop = ns.amps.len() - MAX_SAMPLES;
+                        ns.amps.drain(0..drop);
+                        ns.phases.drain(0..drop);
+                    }
                 }
             }
+            self.dirty_rooms.insert(room);
             ingested += 1;
         }
         ingested
@@ -202,6 +257,8 @@ impl BridgeState {
     /// data. Clears the primary amplitude/phase buffers; keeps last RSSI.
     fn drain_posts(&mut self) -> Vec<CsiPost> {
         let mut posts = Vec::new();
+        // Which rooms saw new node traffic this interval (consumed here).
+        let dirty = std::mem::take(&mut self.dirty_rooms);
         // Snapshot the room ordering to avoid borrow conflicts.
         let rooms = self.rooms.clone();
         for room in rooms {
@@ -210,12 +267,15 @@ impl BridgeState {
                 None => continue,
             };
 
-            // Collect RSSI from every node in the room.
+            // Collect fresh (non-stale) RSSI from every node in the room.
+            let now = Instant::now();
             let mut sensor_rssi = Vec::new();
             for id in &ids {
                 if let Some(ns) = self.nodes.get(id) {
-                    if let Some(r) = ns.last_rssi {
-                        sensor_rssi.push((ns.sensor_id.clone(), r));
+                    if let Some((r, ts)) = ns.last_rssi {
+                        if now.duration_since(ts) <= RSSI_STALE {
+                            sensor_rssi.push((ns.sensor_id.clone(), r));
+                        }
                     }
                 }
             }
@@ -230,8 +290,12 @@ impl BridgeState {
                 None => (Vec::new(), Vec::new()),
             };
 
-            if amplitudes.is_empty() {
-                continue; // nothing new for this room this interval
+            // Emit when the primary produced CSI, OR when a node reported this
+            // interval and we have fresh RSSI to forward (localization stays
+            // current even if the primary was silent). Skip otherwise — don't
+            // re-emit unchanged RSSI on idle flushes.
+            if amplitudes.is_empty() && (sensor_rssi.is_empty() || !dirty.contains(&room)) {
+                continue;
             }
 
             posts.push(CsiPost {
@@ -484,7 +548,56 @@ mod tests {
 
         assert_eq!(state.nodes[&1].amps.len(), 2, "primary buffers a sample per frame");
         assert!(state.nodes[&2].amps.is_empty(), "secondary buffers no series");
-        assert_eq!(state.nodes[&2].last_rssi, Some(-61.0), "secondary still reports RSSI");
+        assert_eq!(state.nodes[&2].last_rssi.map(|(r, _)| r), Some(-61.0), "secondary still reports RSSI");
+    }
+
+    #[test]
+    fn rssi_only_post_when_primary_silent_but_secondary_reports() {
+        let mut state = BridgeState::from_config(&config());
+        // Only the secondary (node 2) reports; the primary (node 1) is silent.
+        state.ingest_datagram(&frame_bytes(2, -61, &[(30, 40)]));
+        let posts = state.drain_posts();
+        assert_eq!(posts.len(), 1, "RSSI must still be forwarded when primary is silent");
+        assert!(posts[0].amplitudes.is_empty(), "no primary CSI => empty series");
+        assert!(posts[0].sensor_rssi.iter().any(|(id, _)| id == "den-b"));
+        // Idle flush (no new traffic) forwards nothing.
+        assert!(state.drain_posts().is_empty());
+    }
+
+    #[test]
+    fn zero_subcarrier_frame_injects_no_sample() {
+        let mut state = BridgeState::from_config(&config());
+        // Degenerate 0-subcarrier frame from the primary.
+        state.ingest_datagram(&frame_bytes(1, -55, &[]));
+        assert!(state.nodes[&1].amps.is_empty(), "zero-subcarrier frame must not push a (0,0) sample");
+    }
+
+    #[test]
+    fn mmwave_presence_survives_a_later_clear_in_same_flush() {
+        let mut state = BridgeState::from_config(&config());
+        // Presence hit, then a "clear" packet for the same room within one flush.
+        state.ingest_datagram(&fused_vitals_bytes(1, 0x01, 72.0, 15.0, 320.0, 1));
+        state.ingest_datagram(&fused_vitals_bytes(1, 0x00, 0.0, 0.0, 0.0, 0));
+        let drained = state.drain_mmwave();
+        assert_eq!(drained.len(), 1);
+        assert!(drained[0].1.presence, "aggregate must not lose the presence detection");
+        assert_eq!(drained[0].1.breathing_bpm, Some(15.0));
+    }
+
+    #[test]
+    fn extra_primaries_in_a_room_are_demoted_to_one() {
+        let cfg = Config {
+            server: default_server(),
+            listen: default_listen(),
+            flush_ms: 1000,
+            nodes: vec![
+                NodeCfg { node_id: 1, room: "Den".into(), sensor_id: "a".into(), primary: true },
+                NodeCfg { node_id: 2, room: "Den".into(), sensor_id: "b".into(), primary: true },
+            ],
+        };
+        let state = BridgeState::from_config(&cfg);
+        let primaries = [1u8, 2].iter().filter(|id| state.nodes[id].is_primary).count();
+        assert_eq!(primaries, 1, "a room must have exactly one primary");
     }
 
     #[test]

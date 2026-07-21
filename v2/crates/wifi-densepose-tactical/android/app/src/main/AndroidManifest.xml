@@ -31,10 +31,10 @@
         android:label="RuView Tactical"
         android:supportsRtl="true"
         android:theme="@android:style/Theme.Material.NoActionBar"
-        android:usesCleartextTraffic="true">
-        <!-- usesCleartextTraffic: the loopback dashboard and the LAN sensor mesh
-             both speak plain HTTP. For a hardened field build, replace this with
-             a network-security-config scoped to 127.0.0.1 + your sensor subnet. -->
+        android:networkSecurityConfig="@xml/network_security_config">
+        <!-- Cleartext is scoped to loopback (127.0.0.1) via the referenced
+             network-security-config, not enabled globally. The app's only
+             outbound cleartext is to the embedded server on loopback. -->
 
         <activity
             android:name=".MainActivity"

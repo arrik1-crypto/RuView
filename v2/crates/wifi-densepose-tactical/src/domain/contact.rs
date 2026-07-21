@@ -97,8 +97,11 @@ pub struct PersonContact {
     /// `true` when the position is a real point fix (>= 3 sensors triangulated);
     /// `false` when it is only the room centroid (room-level presence).
     pub point_fix: bool,
-    /// 95%-confidence radius around `(x, y)` in metres. Room-level contacts use
-    /// the room's enclosing radius.
+    /// Estimated uncertainty radius around `(x, y)` in metres. This is an
+    /// UNCALIBRATED geometric-consistency estimate from an RSSI path-loss model
+    /// (for point fixes) or the room's enclosing radius (for room-level
+    /// presence) — not a validated statistical confidence bound. Treat the true
+    /// through-wall error as larger.
     pub uncertainty_radius_m: f64,
     /// Movement classification.
     pub motion: Motion,

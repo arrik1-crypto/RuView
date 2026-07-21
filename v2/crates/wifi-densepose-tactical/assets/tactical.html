@@ -322,8 +322,10 @@ function renderBle(picture) {
   for (const b of list) {
     const el = document.createElement('div');
     el.className = 'ble';
+    // Coarse buckets only — the RSSI distance model is order-of-magnitude, so a
+    // one-decimal metre value would imply precision the estimate does not have.
     const d = b.distance_est_m;
-    const dist = d < 1 ? '<1 m' : '~' + (d < 10 ? d.toFixed(1) : Math.round(d)) + ' m';
+    const dist = d < 2 ? 'near (<2 m)' : d < 5 ? '~2–5 m' : d < 10 ? '~5–10 m' : 'far (>10 m)';
     el.innerHTML =
       '<span class="sdot" style="background:#7a8cff"></span>' +
       '<span class="id"></span><span class="meta"></span>';

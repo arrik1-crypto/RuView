@@ -20,6 +20,7 @@ class MainActivity : Activity() {
 
     private lateinit var web: WebView
     private var bleScanner: BleScanner? = null
+    private var loadAttempts = 0
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -44,11 +45,22 @@ class MainActivity : Activity() {
                     request: WebResourceRequest?,
                     error: WebResourceError?,
                 ) {
-                    // The native server may still be binding on cold start —
-                    // retry the load shortly instead of showing an error page.
-                    if (request?.isForMainFrame == true) {
-                        view.postDelayed({ view.loadUrl(DASHBOARD_URL) }, 400)
+                    // The native server may still be binding on cold start — retry
+                    // the load with backoff, but CAP the attempts so a server that
+                    // never comes up doesn't loop forever. After the cap, show an
+                    // in-page error with a manual retry instead of spinning.
+                    if (request?.isForMainFrame != true) return
+                    if (loadAttempts < MAX_LOAD_ATTEMPTS) {
+                        loadAttempts++
+                        view.postDelayed({ view.loadUrl(DASHBOARD_URL) }, 400L * loadAttempts)
+                    } else {
+                        view.loadData(SERVER_DOWN_HTML, "text/html", "utf-8")
                     }
+                }
+
+                override fun onPageFinished(view: WebView, url: String?) {
+                    // A successful dashboard load resets the retry budget.
+                    if (url != null && url.startsWith("http")) loadAttempts = 0
                 }
             }
         }
@@ -100,5 +112,10 @@ class MainActivity : Activity() {
         private const val PORT = 8099
         private const val DASHBOARD_URL = "http://127.0.0.1:$PORT/"
         private const val REQ_BLE = 1001
+        private const val MAX_LOAD_ATTEMPTS = 12
+        private const val SERVER_DOWN_HTML =
+            "<html><body style='background:#0b0f14;color:#d7e2ee;font-family:sans-serif;" +
+            "padding:2em'><h2>Tactical server not reachable</h2>" +
+            "<p>The embedded server did not come up. Reopen the app to retry.</p></body></html>"
     }
 }

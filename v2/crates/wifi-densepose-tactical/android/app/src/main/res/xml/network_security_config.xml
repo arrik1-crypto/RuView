@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The app's only outbound cleartext is to the embedded server on loopback (the
+  WebView loads http://127.0.0.1 and the BLE scanner POSTs to it). Everything
+  else is denied cleartext. Inbound LAN POSTs from the sensor mesh are not
+  governed by this policy (it only constrains the app's own outbound requests).
+  For a hardened build, add TLS + a token and drop cleartext entirely.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+    </domain-config>
+</network-security-config>

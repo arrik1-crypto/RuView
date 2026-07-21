@@ -184,8 +184,11 @@ impl TacticalPicture {
 
         let total_occupancy_estimate = room_rollup.iter().map(|r| r.occupancy_estimate).sum();
         let occupied_rooms = room_rollup.iter().filter(|r| r.contact_count > 0).count();
-        let sensors_reporting = sensors.iter().filter(|s| s.reporting).count();
+        // Both counts are over the SAME population (configured floor-plan nodes)
+        // so "X/Y reporting" is always a valid ratio (X <= Y). Unexpected nodes
+        // still appear in the `sensors` list but do not inflate the headline.
         let sensors_total = sensors.iter().filter(|s| s.configured).count();
+        let sensors_reporting = sensors.iter().filter(|s| s.configured && s.reporting).count();
 
         Self {
             structure_name: structure_name.to_string(),

@@ -146,10 +146,33 @@ struct CsiFrameInput {
 /// Ingest raw CSI: buffer it in the room's MAT pipeline, distil vitals, and — if
 /// a detection lands — feed the engine (else record an absence). Returns the
 /// updated picture so a node can see the effect of its frame.
+/// Max CSI samples accepted in one `/api/csi` body. Generous (minutes of data at
+/// CSI rates) but bounds a single malicious/buggy POST's memory + work.
+const MAX_CSI_SAMPLES: usize = 200_000;
+
 async fn post_csi(
     State(state): State<AppState>,
     Json(frame): Json<CsiFrameInput>,
 ) -> impl IntoResponse {
+    // Wire-boundary validation: the two series must be equal length (MAT keeps
+    // them in lockstep; a mismatch would later panic its ring-buffer trim) and
+    // bounded in size. Reject before any buffering so a bad body can neither
+    // crash nor poison the room pipeline.
+    if frame.amplitudes.len() != frame.phases.len() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "amplitudes and phases must be equal length" })),
+        )
+            .into_response();
+    }
+    if frame.amplitudes.len() > MAX_CSI_SAMPLES {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "too many samples", "max": MAX_CSI_SAMPLES })),
+        )
+            .into_response();
+    }
+
     let room_id = {
         let engine = state.engine.read().await;
         engine.resolve_room(frame.room_id, frame.room_name.as_deref())
@@ -162,24 +185,25 @@ async fn post_csi(
             .into_response();
     };
 
-    let vitals = {
-        let ingest = state.ingest.read().await;
-        if !ingest.push(room_id, &frame.amplitudes, &frame.phases) {
+    // Clone the room's ingest handle under a brief lock, then push + distil
+    // OUTSIDE the ingest map lock, so this room's DSP never stalls a concurrent
+    // structure rebuild or another room's ingest.
+    let Some(room) = ({ state.ingest.read().await.room(room_id) }) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "unknown room" })),
+        )
+            .into_response();
+    };
+    room.push(&frame.amplitudes, &frame.phases);
+    let vitals = match room.distill().await {
+        Ok(v) => v,
+        Err(e) => {
             return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": "unknown room" })),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
             )
-                .into_response();
-        }
-        match ingest.distill(room_id).await {
-            Ok(v) => v,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "error": e.to_string() })),
-                )
-                    .into_response()
-            }
+                .into_response()
         }
     };
 
@@ -291,7 +315,9 @@ async fn post_ble(
 ) -> impl IntoResponse {
     {
         let mut ble = state.ble.write().await;
-        ble.observe(&scan.devices);
+        // Bound the per-request batch; the tracker also caps total devices.
+        let n = scan.devices.len().min(2048);
+        ble.observe(&scan.devices[..n]);
         ble.prune();
     }
     state.broadcast_picture().await;
