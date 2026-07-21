@@ -28,6 +28,26 @@ pub struct RoomOccupancy {
     pub localizable: bool,
 }
 
+/// Health of a single sensor node, as of the snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SensorSummary {
+    /// Node id (matches a `SensorPlacement::id` and the `id` in RSSI readings).
+    pub id: String,
+    /// Room the node is assigned to (or last reported from).
+    pub room_id: Option<RoomId>,
+    /// Room label, denormalized for display.
+    pub room_name: Option<String>,
+    /// `true` if the node is part of the loaded floor plan; `false` for an
+    /// unexpected node that reported but is not in the structure.
+    pub configured: bool,
+    /// `true` if the node reported within the freshness window.
+    pub reporting: bool,
+    /// Seconds since the node was last heard from (`None` = never seen).
+    pub age_secs: Option<i64>,
+    /// Most recent RSSI reported by the node (dBm).
+    pub last_rssi: Option<f64>,
+}
+
 /// A snapshot of the whole structure at a moment in time.
 ///
 /// This is the payload streamed to the tactical dashboard and returned by
@@ -46,6 +66,12 @@ pub struct TacticalPicture {
     pub total_occupancy_estimate: u32,
     /// Number of rooms with at least one contact.
     pub occupied_rooms: usize,
+    /// Per-node sensor health.
+    pub sensors: Vec<SensorSummary>,
+    /// How many nodes are currently reporting.
+    pub sensors_reporting: usize,
+    /// How many nodes are configured in the floor plan.
+    pub sensors_total: usize,
     /// A standing reminder rendered by clients. Kept in the payload so it can
     /// never be dropped by a thin viewer.
     pub advisory: String,
@@ -64,6 +90,7 @@ impl TacticalPicture {
         rooms: &[Room],
         contacts: Vec<PersonContact>,
         occupancy_by_room: &[(RoomId, u32)],
+        sensors: Vec<SensorSummary>,
     ) -> Self {
         let room_rollup: Vec<RoomOccupancy> = rooms
             .iter()
@@ -93,6 +120,8 @@ impl TacticalPicture {
 
         let total_occupancy_estimate = room_rollup.iter().map(|r| r.occupancy_estimate).sum();
         let occupied_rooms = room_rollup.iter().filter(|r| r.contact_count > 0).count();
+        let sensors_reporting = sensors.iter().filter(|s| s.reporting).count();
+        let sensors_total = sensors.iter().filter(|s| s.configured).count();
 
         Self {
             structure_name: structure_name.to_string(),
@@ -101,6 +130,9 @@ impl TacticalPicture {
             contacts,
             total_occupancy_estimate,
             occupied_rooms,
+            sensors,
+            sensors_reporting,
+            sensors_total,
             advisory: STANDING_ADVISORY.to_string(),
         }
     }

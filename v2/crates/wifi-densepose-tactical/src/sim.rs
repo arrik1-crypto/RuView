@@ -108,21 +108,18 @@ impl Scenario {
     }
 
     fn reading_for(&mut self, t: &RoomTruth) -> ReadingInput {
-        if t.occupancy == 0 {
-            return ReadingInput {
-                room_id: Some(t.room_id),
-                room_name: None,
-                presence: false,
-                breathing_bpm: None,
-                movement: MovementLevel::None,
-                occupancy: Some(0),
-                sensor_rssi: vec![],
-            };
-        }
+        // A room's nodes report every cycle (even when empty — a live node still
+        // says "no one here"), except on an occasional dropout (~1 in 14) where
+        // the whole room's nodes go quiet, exercising the sensor-status panel.
+        let dropout = self.next_u32() % 14 == 0;
+        let sensor_rssi = if dropout {
+            vec![]
+        } else {
+            self.rssi_for_room(t.room_id)
+        };
 
-        // Occasional dropped cycle for an occupied room (~1 in 12).
-        let dropped = self.next_u32() % 12 == 0;
-        if dropped {
+        // Empty room, or a dropout cycle: no presence.
+        if t.occupancy == 0 || dropout {
             return ReadingInput {
                 room_id: Some(t.room_id),
                 room_name: None,
@@ -130,19 +127,17 @@ impl Scenario {
                 breathing_bpm: None,
                 movement: MovementLevel::None,
                 occupancy: Some(0),
-                sensor_rssi: vec![],
+                sensor_rssi,
             };
         }
 
         let movement = if t.moving {
             MovementLevel::Gross
-        } else {
+        } else if self.next_u32() % 4 == 0 {
             // Still occupants show intermittent micro-motion.
-            if self.next_u32() % 4 == 0 {
-                MovementLevel::Fine
-            } else {
-                MovementLevel::None
-            }
+            MovementLevel::Fine
+        } else {
+            MovementLevel::None
         };
 
         let breathing_bpm = if t.breathing {
@@ -151,8 +146,6 @@ impl Scenario {
         } else {
             None
         };
-
-        let sensor_rssi = self.rssi_for_room(t.room_id);
 
         ReadingInput {
             room_id: Some(t.room_id),

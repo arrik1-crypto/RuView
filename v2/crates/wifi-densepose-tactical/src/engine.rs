@@ -1,15 +1,23 @@
 //! The tactical engine: ingest readings, localize, track contacts, emit pictures.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Duration, Utc};
 use wifi_densepose_mat::localization::LocalizationService;
 
 use crate::domain::contact::{ContactId, PersonContact};
-use crate::domain::picture::TacticalPicture;
+use crate::domain::picture::{SensorSummary, TacticalPicture};
 use crate::domain::reading::RoomReading;
 use crate::domain::structure::{Room, RoomId, Structure};
 use crate::error::TacticalError;
+
+/// Last-heard state for one sensor node.
+#[derive(Debug, Clone)]
+struct SensorActivity {
+    room_id: RoomId,
+    last_seen: DateTime<Utc>,
+    last_rssi: Option<f64>,
+}
 
 /// Tunables for tracking behaviour.
 #[derive(Debug, Clone)]
@@ -21,6 +29,9 @@ pub struct EngineConfig {
     /// [`TacticalEngine::prune_stale`]. Keeps the picture from showing ghosts
     /// after a subject leaves or sensing stops.
     pub contact_ttl_secs: i64,
+    /// A sensor node not heard from within this many seconds is reported as not
+    /// reporting (a dropout) in the sensor status roll-up.
+    pub sensor_stale_secs: i64,
 }
 
 impl Default for EngineConfig {
@@ -28,6 +39,7 @@ impl Default for EngineConfig {
         Self {
             position_alpha: 0.5,
             contact_ttl_secs: 8,
+            sensor_stale_secs: 6,
         }
     }
 }
@@ -43,6 +55,8 @@ pub struct TacticalEngine {
     contacts: HashMap<RoomId, PersonContact>,
     /// Latest occupancy estimate per room (>= 1 when occupied, 0 when cleared).
     occupancy: HashMap<RoomId, u32>,
+    /// Last-heard state per sensor node id.
+    sensors: HashMap<String, SensorActivity>,
     config: EngineConfig,
 }
 
@@ -54,6 +68,7 @@ impl TacticalEngine {
             localizer: LocalizationService::new(),
             contacts: HashMap::new(),
             occupancy: HashMap::new(),
+            sensors: HashMap::new(),
             config: EngineConfig::default(),
         }
     }
@@ -71,6 +86,82 @@ impl TacticalEngine {
         self.structure = structure;
         self.contacts.clear();
         self.occupancy.clear();
+        self.sensors.clear();
+    }
+
+    /// Record that a set of sensor nodes just reported (from a reading or CSI
+    /// frame), refreshing their last-heard time and RSSI. Called on every live
+    /// data path — including absences — so node health reflects link state, not
+    /// whether a person was detected.
+    pub fn note_sensors(&mut self, room_id: RoomId, rssi: &[(String, f64)]) {
+        if rssi.is_empty() {
+            return;
+        }
+        let now = Utc::now();
+        for (id, r) in rssi {
+            self.sensors.insert(
+                id.clone(),
+                SensorActivity {
+                    room_id,
+                    last_seen: now,
+                    last_rssi: Some(*r),
+                },
+            );
+        }
+    }
+
+    /// Per-node health roll-up: every configured node plus any unexpected nodes
+    /// that reported, each flagged reporting/stale against the freshness window.
+    pub fn sensor_report(&self) -> Vec<SensorSummary> {
+        self.sensor_report_at(Utc::now())
+    }
+
+    /// Sensor report against an explicit `now` (testable without wall-clock waits).
+    pub fn sensor_report_at(&self, now: DateTime<Utc>) -> Vec<SensorSummary> {
+        let window = self.config.sensor_stale_secs;
+        let mut out = Vec::new();
+        let mut configured_ids = HashSet::new();
+
+        for room in &self.structure.rooms {
+            for s in &room.sensors {
+                configured_ids.insert(s.id.clone());
+                let (reporting, age, rssi) = match self.sensors.get(&s.id) {
+                    Some(a) => {
+                        let age = (now - a.last_seen).num_seconds();
+                        ((0..=window).contains(&age), Some(age), a.last_rssi)
+                    }
+                    None => (false, None, None),
+                };
+                out.push(SensorSummary {
+                    id: s.id.clone(),
+                    room_id: Some(room.id),
+                    room_name: Some(room.name.clone()),
+                    configured: true,
+                    reporting,
+                    age_secs: age,
+                    last_rssi: rssi,
+                });
+            }
+        }
+
+        // Nodes that reported but are not in the loaded floor plan.
+        for (id, a) in &self.sensors {
+            if !configured_ids.contains(id) {
+                let age = (now - a.last_seen).num_seconds();
+                out.push(SensorSummary {
+                    id: id.clone(),
+                    room_id: Some(a.room_id),
+                    room_name: self.structure.room(a.room_id).map(|r| r.name.clone()),
+                    configured: false,
+                    reporting: (0..=window).contains(&age),
+                    age_secs: Some(age),
+                    last_rssi: a.last_rssi,
+                });
+            }
+        }
+
+        out.sort_by(|a, b| a.room_name.cmp(&b.room_name).then_with(|| a.id.cmp(&b.id)));
+        out
     }
 
     /// The loaded structure.
@@ -105,6 +196,7 @@ impl TacticalEngine {
             .clone();
 
         let now = Utc::now();
+        self.note_sensors(room.id, &reading.sensor_rssi);
         self.occupancy.insert(room.id, reading.occupancy.max(1));
 
         let (x, y, point_fix, uncertainty) = self.localize(&room, &reading);
@@ -169,6 +261,14 @@ impl TacticalEngine {
                         .unwrap_or_else(|| "unspecified".to_string()),
                 )
             })?;
+        // Note node activity from every reading — including absences — so the
+        // sensor roll-up tracks link state, not just detections.
+        let rssi: Vec<(String, f64)> = input
+            .sensor_rssi
+            .iter()
+            .map(|s| (s.id.clone(), s.rssi))
+            .collect();
+        self.note_sensors(room_id, &rssi);
         match input.to_vitals() {
             Some(vitals) => {
                 let reading = RoomReading {
@@ -231,6 +331,7 @@ impl TacticalEngine {
             &self.structure.rooms,
             contacts,
             &occupancy,
+            self.sensor_report(),
         )
     }
 
@@ -343,6 +444,47 @@ mod tests {
         let pic = engine.picture();
         assert_eq!(pic.contacts.len(), 0);
         assert_eq!(pic.total_occupancy_estimate, 0);
+    }
+
+    #[test]
+    fn reporting_nodes_are_tracked() {
+        let (structure, id) = structure_with_triangulable_room();
+        let mut engine = TacticalEngine::new(structure);
+        let rssi = vec![
+            SensorRssi { id: "s1".into(), rssi: -55.0 },
+            SensorRssi { id: "s2".into(), rssi: -60.0 },
+            SensorRssi { id: "s3".into(), rssi: -58.0 },
+        ];
+        engine.ingest(reading_for(id, rssi)).unwrap();
+        let pic = engine.picture();
+        assert_eq!(pic.sensors_total, 3, "3 configured nodes");
+        assert_eq!(pic.sensors_reporting, 3, "all 3 just reported");
+        assert!(pic.sensors.iter().all(|s| s.reporting && s.last_rssi.is_some()));
+    }
+
+    #[test]
+    fn nodes_go_stale_after_window() {
+        let (structure, id) = structure_with_triangulable_room();
+        let mut engine = TacticalEngine::new(structure);
+        let rssi = vec![
+            SensorRssi { id: "s1".into(), rssi: -55.0 },
+            SensorRssi { id: "s2".into(), rssi: -60.0 },
+            SensorRssi { id: "s3".into(), rssi: -58.0 },
+        ];
+        engine.ingest(reading_for(id, rssi)).unwrap();
+        // Far-future cutoff => every node is past the freshness window.
+        let report = engine.sensor_report_at(Utc::now() + Duration::seconds(3600));
+        assert!(report.iter().all(|s| !s.reporting));
+        assert!(report.iter().all(|s| s.configured));
+    }
+
+    #[test]
+    fn configured_node_with_no_data_reads_not_reporting() {
+        let (structure, _) = structure_with_triangulable_room();
+        let engine = TacticalEngine::new(structure);
+        let report = engine.sensor_report();
+        assert_eq!(report.len(), 3);
+        assert!(report.iter().all(|s| !s.reporting && s.age_secs.is_none()));
     }
 
     #[test]

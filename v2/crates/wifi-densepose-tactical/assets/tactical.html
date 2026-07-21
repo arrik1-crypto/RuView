@@ -55,6 +55,17 @@
     border-top: 1px solid var(--line); }
   .legend span { display: inline-flex; align-items: center; gap: 5px; }
   .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+  .muted { color: var(--muted); font-weight: 400; }
+  .sensor { display: flex; align-items: center; gap: 8px; padding: 5px 8px;
+    border: 1px solid var(--line); border-radius: 5px; margin-bottom: 5px; font-size: 12px; }
+  .sensor.stale { opacity: .65; }
+  .sensor .id { font-weight: 600; }
+  .sensor .rm { color: var(--muted); font-size: 11px; }
+  .sensor .meta { margin-left: auto; color: var(--muted); font-size: 11px; text-align: right; }
+  .sensor.stale .meta { color: var(--active); }
+  .sdot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; }
+  .sdot.up { background: var(--focus); }
+  .sdot.down { background: var(--active); }
   .summary { font-size: 12px; color: var(--ink); background: #0e1620;
     border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; }
   .disc { font-size: 11px; color: var(--muted); margin-top: 8px; line-height: 1.5; }
@@ -74,6 +85,7 @@
   <h1 id="structure-name">RuView Tactical</h1>
   <div class="stat">People (est.) <b id="stat-people">–</b></div>
   <div class="stat">Occupied rooms <b id="stat-rooms">–</b></div>
+  <div class="stat">Nodes <b id="stat-nodes">–</b></div>
   <div id="status" class="down">Link <b>connecting…</b></div>
   <div class="mode" id="mode-badge">—</div>
 </div>
@@ -86,6 +98,8 @@
     <div class="disc" id="disc"></div>
     <h2>Rooms — attention order</h2>
     <div id="rooms"></div>
+    <h2>Sensors <span id="sensors-count" class="muted"></span></h2>
+    <div id="sensors"></div>
   </aside>
 </main>
 
@@ -197,6 +211,7 @@ function renderPanels() {
     document.getElementById('stat-people').textContent = picture.total_occupancy_estimate;
     document.getElementById('stat-rooms').textContent = picture.occupied_rooms;
     document.getElementById('disc').textContent = picture.advisory;
+    renderSensors(picture);
   }
   if (entry) {
     document.getElementById('summary').textContent = entry.summary;
@@ -215,6 +230,38 @@ function renderPanels() {
       el.querySelector('.why').textContent = r.rationale;
       host.appendChild(el);
     }
+  }
+}
+
+function renderSensors(picture) {
+  const nodes = document.getElementById('stat-nodes');
+  const total = picture.sensors_total || 0;
+  const up = picture.sensors_reporting || 0;
+  nodes.textContent = up + '/' + total;
+  nodes.style.color = (total > 0 && up < total) ? 'var(--restless)' : '';
+  document.getElementById('sensors-count').textContent =
+    total ? '(' + up + '/' + total + ' up)' : '';
+
+  const host = document.getElementById('sensors');
+  host.innerHTML = '';
+  const list = (picture.sensors || []).slice().sort((a, b) =>
+    (b.reporting - a.reporting) || String(a.room_name).localeCompare(String(b.room_name)));
+  for (const s of list) {
+    const el = document.createElement('div');
+    el.className = 'sensor' + (s.reporting ? '' : ' stale');
+    let age;
+    if (s.age_secs == null) age = 'never seen';
+    else if (s.reporting) age = s.age_secs <= 1 ? 'now' : s.age_secs + 's ago';
+    else age = 'stale ' + s.age_secs + 's';
+    const rssi = (s.last_rssi == null) ? '' : Math.round(s.last_rssi) + ' dBm';
+    el.innerHTML =
+      '<span class="sdot ' + (s.reporting ? 'up' : 'down') + '"></span>' +
+      '<span class="id"></span><span class="rm"></span><span class="meta"></span>';
+    el.querySelector('.id').textContent = s.id;
+    el.querySelector('.rm').textContent =
+      s.room_name ? '· ' + s.room_name : (s.configured ? '' : '· unexpected');
+    el.querySelector('.meta').textContent = [rssi, age].filter(Boolean).join('  ·  ');
+    host.appendChild(el);
   }
 }
 

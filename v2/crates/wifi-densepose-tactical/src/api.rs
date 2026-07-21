@@ -69,6 +69,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/csi", post(post_csi))
         .route("/api/picture", get(get_picture))
         .route("/api/entry", get(get_entry))
+        .route("/api/sensors", get(get_sensors))
         .route("/ws", get(ws_handler))
         .layer(CorsLayer::permissive())
         .with_state(state)
@@ -173,6 +174,9 @@ async fn post_csi(
         .collect();
     {
         let mut engine = state.engine.write().await;
+        // Record node activity regardless of the detection outcome, so a node
+        // reporting "no one here" still counts as reporting.
+        engine.note_sensors(room_id, &sensor_rssi);
         match vitals {
             Some(v) if v.has_vitals() => {
                 let reading = RoomReading {
@@ -227,6 +231,11 @@ async fn get_picture(State(state): State<AppState>) -> impl IntoResponse {
 async fn get_entry(State(state): State<AppState>) -> impl IntoResponse {
     let picture = { state.engine.read().await.picture() };
     Json(EntryAdvisor::assess(&picture))
+}
+
+async fn get_sensors(State(state): State<AppState>) -> impl IntoResponse {
+    let report = { state.engine.read().await.sensor_report() };
+    Json(report)
 }
 
 async fn ws_handler(
