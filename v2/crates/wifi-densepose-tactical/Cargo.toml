@@ -23,6 +23,10 @@ api = ["sim", "dep:axum", "dep:tokio", "dep:tower-http", "dep:futures-util"]
 # Build the `.so` with `cargo ndk` (see `android/`). Pure-Rust tree — no NDK C
 # libs are pulled beyond the standard Android toolchain.
 android = ["api", "dep:jni"]
+# `bridge` builds the `ruview-csi-bridge` host tool: a UDP listener that decodes
+# ESP32 ADR-018 CSI frames (via wifi-densepose-hardware) and forwards them to a
+# tactical server's `/api/csi`. Host-side only — NOT part of the APK/library.
+bridge = ["dep:wifi-densepose-hardware", "dep:ureq"]
 
 # Build a C-ABI dynamic library (`libwifi_densepose_tactical.so`) for the
 # Android JNI shell, while keeping the normal `lib`/`bin` targets for desktop.
@@ -55,10 +59,19 @@ futures-util = { version = "0.3", optional = true }
 # JNI bridge for the Android APK shell (feature = "android").
 jni = { version = "0.21", optional = true }
 
+# CSI bridge (feature = "bridge") — ESP32 ADR-018 frame decode + HTTP forward.
+wifi-densepose-hardware = { version = "0.3.0", path = "../wifi-densepose-hardware", optional = true }
+ureq = { version = "2", default-features = false, features = ["json"], optional = true }
+
 [[bin]]
 name = "ruview-tactical"
 path = "src/main.rs"
 required-features = ["api"]
+
+[[bin]]
+name = "ruview-csi-bridge"
+path = "src/bin/csi_bridge.rs"
+required-features = ["bridge"]
 
 [dev-dependencies]
 tokio = { version = "1.35", features = ["rt", "macros", "sync", "time"] }

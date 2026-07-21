@@ -28,7 +28,10 @@ room per cycle:
 - **`POST /api/csi`** — raw CSI: `{ room_name|room_id, amplitudes[], phases[],
   sensor_rssi[] }`. The phone runs MAT's detection pipeline on-device (breathing
   / movement) and updates the picture once ~5 s of signal is buffered. Use this
-  when nodes stream raw CSI.
+  when nodes stream raw CSI. The **`ruview-csi-bridge`** host tool (in this crate,
+  `--features bridge`) does exactly this from an ESP32 mesh: it listens for the
+  nodes' ADR-018 UDP CSI and forwards to `/api/csi` per room — point it at the
+  phone's LAN IP. See `examples/csi-bridge.example.json`.
 - **`POST /api/reading`** — pre-distilled: `{ presence, breathing_bpm, movement,
   occupancy, sensor_rssi }`. Use this when an aggregator already ran the CSI→
   vitals DSP.

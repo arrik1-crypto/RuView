@@ -58,8 +58,8 @@ impl AppState {
     /// device layer attached. Every client-facing response goes through this so
     /// the two layers stay in one payload.
     pub async fn current_picture(&self) -> TacticalPicture {
-        let mut picture = { self.engine.read().await.picture() };
-        picture.ble_devices = { self.ble.read().await.snapshot() };
+        let mut picture = self.engine.read().await.picture();
+        picture.ble_devices = self.ble.read().await.snapshot();
         picture
     }
 

@@ -11199,7 +11199,9 @@ dependencies = [
  "tokio",
  "tower-http",
  "tracing",
+ "ureq 2.12.1",
  "uuid",
+ "wifi-densepose-hardware",
  "wifi-densepose-mat",
 ]
 

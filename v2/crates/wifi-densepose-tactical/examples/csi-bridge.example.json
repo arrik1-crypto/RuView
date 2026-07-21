@@ -1,0 +1,12 @@
+{
+  "server": "http://127.0.0.1:8099",
+  "listen": "0.0.0.0:5566",
+  "flush_ms": 1000,
+  "nodes": [
+    { "node_id": 1, "room": "Bedroom 2", "sensor_id": "bed2-a", "primary": true },
+    { "node_id": 2, "room": "Bedroom 2", "sensor_id": "bed2-b" },
+    { "node_id": 3, "room": "Bedroom 2", "sensor_id": "bed2-c" },
+    { "node_id": 4, "room": "Hallway", "sensor_id": "hall-a", "primary": true },
+    { "node_id": 5, "room": "Hallway", "sensor_id": "hall-b" }
+  ]
+}
