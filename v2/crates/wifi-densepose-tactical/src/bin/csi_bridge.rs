@@ -34,7 +34,9 @@ fn default_server() -> String {
     "http://127.0.0.1:8099".to_string()
 }
 fn default_listen() -> String {
-    "0.0.0.0:5566".to_string()
+    // Matches the ESP32 firmware's default UDP target port (CONFIG_CSI_TARGET_PORT
+    // = 5005) so nodes and bridge line up with no extra provisioning.
+    "0.0.0.0:5005".to_string()
 }
 fn default_flush_ms() -> u64 {
     1000

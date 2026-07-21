@@ -1,6 +1,6 @@
 {
   "server": "http://127.0.0.1:8099",
-  "listen": "0.0.0.0:5566",
+  "listen": "0.0.0.0:5005",
   "flush_ms": 1000,
   "nodes": [
     { "node_id": 1, "room": "Bedroom 2", "sensor_id": "bed2-a", "primary": true },
