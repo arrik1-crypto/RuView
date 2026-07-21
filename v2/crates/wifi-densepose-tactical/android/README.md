@@ -38,34 +38,53 @@ gives room-level presence.
 
 ## Build
 
-Prerequisites (on the build machine — Android Studio provides the SDK/NDK):
+Prerequisites (on the build machine):
 
-```bash
-rustup target add aarch64-linux-android armv7-linux-androideabi \
-                  x86_64-linux-android i686-linux-android
-cargo install cargo-ndk
-export ANDROID_NDK_HOME=/path/to/Android/Sdk/ndk/<version>
-```
+- **JDK 17**, **Android SDK** (platform 34 + build-tools + platform-tools), and
+  the **Android NDK** (r26+). Android Studio installs all three via its SDK
+  Manager; or use `sdkmanager` directly.
+- Rust Android targets + `cargo-ndk`:
 
-1. **Cross-compile the native libs** (drops `.so` into `app/src/main/jniLibs/`):
+  ```bash
+  rustup target add aarch64-linux-android armv7-linux-androideabi \
+                    x86_64-linux-android i686-linux-android
+  cargo install cargo-ndk
+  export ANDROID_NDK_HOME=/path/to/Android/Sdk/ndk/<version>
+  ```
+- Tell Gradle where the SDK is — either `export ANDROID_HOME=/path/to/Android/Sdk`
+  or create `android/local.properties` with `sdk.dir=/path/to/Android/Sdk`
+  (machine-specific, not committed).
+
+1. **Cross-compile the native libs FIRST** (drops `.so` into
+   `app/src/main/jniLibs/`). This must happen before the Gradle build, or the
+   app will hit `UnsatisfiedLinkError` at launch:
 
    ```bash
    ./build-jni.sh
    ```
 
-2. **Build the APK.** The Gradle wrapper is committed, so no Android Studio and
-   no local Gradle install is needed — just:
+2. **Build an installable (debug-signed) APK.** The Gradle wrapper is committed,
+   so no Android Studio and no local Gradle install is needed:
 
    ```bash
-   ./gradlew assembleRelease     # unsigned: app/build/outputs/apk/release/
+   ./gradlew assembleDebug       # app/build/outputs/apk/debug/app-debug.apk
+   ```
+
+   `assembleDebug` auto-signs with the debug keystore, so it installs directly.
+   `assembleRelease` produces an **unsigned** APK — for distribution, add a
+   `signingConfig` + keystore (or sign with `apksigner`) before installing.
+
+3. **Install it** on a device with USB debugging on:
+
+   ```bash
+   adb install -r app/build/outputs/apk/debug/app-debug.apk
    ```
 
    (Or open this `android/` folder in Android Studio and press Run.)
 
-3. **Sign** for distribution (`apksigner` / an Android keystore) and install.
-
-For a demo build with no hardware, set `nativeStart(PORT, true)` in
-`MainActivity.kt` — the app then runs the built-in synthetic scenario.
+For a first-run smoke test with no hardware, set `nativeStart(PORT, true)` in
+`MainActivity.kt` — the app then runs the built-in synthetic scenario and you
+should see contacts + the sensor panel populate immediately.
 
 ## ⚠ Operational note
 
