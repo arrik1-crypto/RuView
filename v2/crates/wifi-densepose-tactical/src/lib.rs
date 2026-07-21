@@ -68,6 +68,10 @@ pub mod sim;
 #[cfg(feature = "api")]
 pub mod api;
 
+/// Raw-CSI → vital-signs ingest bridge (one MAT detection pipeline per room).
+#[cfg(feature = "api")]
+pub mod ingest;
+
 /// JNI entry point for the Android APK shell. See `android/` for the build.
 #[cfg(feature = "android")]
 pub mod android;

@@ -17,18 +17,24 @@ nothing is fetched at runtime.
 ## Data flow
 
 ```
-ESP32/CSI nodes ──(CSI→vitals DSP)──> ReadingInput JSON
-       │  POST http://<phone-LAN-IP>:8099/api/reading
-       ▼
-  APK (0.0.0.0:8099) ── engine ── WebView @ 127.0.0.1:8099
+ESP32/CSI nodes ──> APK (0.0.0.0:8099) ── engine ── WebView @ 127.0.0.1:8099
 ```
 
 The server binds `0.0.0.0`, so provision your sensor nodes with the **phone's
-LAN IP** as the target (the RuView firmware's `--target-ip`). Each reading is the
-distilled `ReadingInput` shape (`presence`, `breathing_bpm`, `movement`,
-`occupancy`, `sensor_rssi`) — run the CSI→vitals DSP on the node/aggregator side
-(MAT's `DetectionPipeline`), not on the phone. Post your floor plan once to
-`/api/structure`; then stream `/api/reading` per room per cycle.
+LAN IP** as the target (the RuView firmware's `--target-ip`). Post your floor
+plan once to `POST /api/structure`, then feed one of two ingest endpoints per
+room per cycle:
+
+- **`POST /api/csi`** — raw CSI: `{ room_name|room_id, amplitudes[], phases[],
+  sensor_rssi[] }`. The phone runs MAT's detection pipeline on-device (breathing
+  / movement) and updates the picture once ~5 s of signal is buffered. Use this
+  when nodes stream raw CSI.
+- **`POST /api/reading`** — pre-distilled: `{ presence, breathing_bpm, movement,
+  occupancy, sensor_rssi }`. Use this when an aggregator already ran the CSI→
+  vitals DSP.
+
+Either way, `sensor_rssi` (≥3 nodes) enables a triangulated point fix; fewer
+gives room-level presence.
 
 ## Build
 
@@ -47,12 +53,14 @@ export ANDROID_NDK_HOME=/path/to/Android/Sdk/ndk/<version>
    ./build-jni.sh
    ```
 
-2. **Build the APK.** Open this `android/` folder in Android Studio and press
-   Run, or from the CLI (after `gradle wrapper` or with a local Gradle 8.7+):
+2. **Build the APK.** The Gradle wrapper is committed, so no Android Studio and
+   no local Gradle install is needed — just:
 
    ```bash
    ./gradlew assembleRelease     # unsigned: app/build/outputs/apk/release/
    ```
+
+   (Or open this `android/` folder in Android Studio and press Run.)
 
 3. **Sign** for distribution (`apksigner` / an Android keystore) and install.
 

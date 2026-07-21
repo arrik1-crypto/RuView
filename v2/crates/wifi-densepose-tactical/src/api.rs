@@ -20,10 +20,11 @@ use axum::{
 use tokio::sync::{broadcast, RwLock};
 use tower_http::cors::CorsLayer;
 
-use crate::domain::reading::ReadingInput;
-use crate::domain::structure::Structure;
+use crate::domain::reading::{ReadingInput, RoomReading, SensorRssi};
+use crate::domain::structure::{RoomId, Structure};
 use crate::engine::TacticalEngine;
 use crate::entry::EntryAdvisor;
+use crate::ingest::{CsiIngest, DEFAULT_CSI_SAMPLE_RATE};
 
 /// Shared application state.
 #[derive(Clone)]
@@ -32,15 +33,19 @@ pub struct AppState {
     pub engine: Arc<RwLock<TacticalEngine>>,
     /// Broadcast of serialized [`TacticalPicture`] JSON to live dashboards.
     pub updates: broadcast::Sender<String>,
+    /// Raw-CSI ingest bridge (one MAT detection pipeline per room).
+    pub ingest: Arc<RwLock<CsiIngest>>,
 }
 
 impl AppState {
     /// Build state around an engine.
     pub fn new(engine: TacticalEngine) -> Self {
         let (updates, _) = broadcast::channel(64);
+        let ingest = CsiIngest::from_structure(engine.structure(), DEFAULT_CSI_SAMPLE_RATE);
         Self {
             engine: Arc::new(RwLock::new(engine)),
             updates,
+            ingest: Arc::new(RwLock::new(ingest)),
         }
     }
 
@@ -61,6 +66,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/health", get(health))
         .route("/api/structure", get(get_structure).post(post_structure))
         .route("/api/reading", post(post_reading))
+        .route("/api/csi", post(post_csi))
         .route("/api/picture", get(get_picture))
         .route("/api/entry", get(get_entry))
         .route("/ws", get(ws_handler))
@@ -95,8 +101,100 @@ async fn post_structure(
         let mut engine = state.engine.write().await;
         engine.set_structure(structure);
     }
+    // Rebuild the CSI pipelines so they match the new room set.
+    {
+        let structure = state.engine.read().await.structure().clone();
+        state.ingest.write().await.rebuild(&structure);
+    }
     state.broadcast_picture().await;
     StatusCode::NO_CONTENT
+}
+
+/// A raw CSI frame for one room, as pushed by a sensor node.
+#[derive(serde::Deserialize)]
+struct CsiFrameInput {
+    #[serde(default)]
+    room_id: Option<RoomId>,
+    #[serde(default)]
+    room_name: Option<String>,
+    /// CSI amplitude samples.
+    amplitudes: Vec<f64>,
+    /// Unwrapped CSI phase samples (same length as `amplitudes`).
+    phases: Vec<f64>,
+    /// Per-sensor RSSI for localization (optional).
+    #[serde(default)]
+    sensor_rssi: Vec<SensorRssi>,
+}
+
+/// Ingest raw CSI: buffer it in the room's MAT pipeline, distil vitals, and — if
+/// a detection lands — feed the engine (else record an absence). Returns the
+/// updated picture so a node can see the effect of its frame.
+async fn post_csi(
+    State(state): State<AppState>,
+    Json(frame): Json<CsiFrameInput>,
+) -> impl IntoResponse {
+    let room_id = {
+        let engine = state.engine.read().await;
+        engine.resolve_room(frame.room_id, frame.room_name.as_deref())
+    };
+    let Some(room_id) = room_id else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "unknown room" })),
+        )
+            .into_response();
+    };
+
+    let vitals = {
+        let ingest = state.ingest.read().await;
+        if !ingest.push(room_id, &frame.amplitudes, &frame.phases) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "unknown room" })),
+            )
+                .into_response();
+        }
+        match ingest.distill(room_id).await {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": e.to_string() })),
+                )
+                    .into_response()
+            }
+        }
+    };
+
+    let sensor_rssi: Vec<(String, f64)> = frame
+        .sensor_rssi
+        .iter()
+        .map(|s| (s.id.clone(), s.rssi))
+        .collect();
+    {
+        let mut engine = state.engine.write().await;
+        match vitals {
+            Some(v) if v.has_vitals() => {
+                let reading = RoomReading {
+                    room_id,
+                    vitals: v,
+                    occupancy: 1,
+                    sensor_rssi,
+                };
+                let _ = engine.ingest(reading);
+            }
+            // Enough data but nothing detected → the room reads clear.
+            Some(_) => {
+                let _ = engine.record_absence(room_id);
+            }
+            // Not enough buffered CSI yet → leave the current picture untouched.
+            None => {}
+        }
+    }
+
+    state.broadcast_picture().await;
+    let picture = { state.engine.read().await.picture() };
+    (StatusCode::OK, Json(picture)).into_response()
 }
 
 async fn post_reading(
